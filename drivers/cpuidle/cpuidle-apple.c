@@ -127,10 +127,12 @@ static int apple_cpuidle_probe(struct platform_device *pdev)
 	/*
 	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
 	 * T8140. Its WFI already lets the hardware power-gate idle
-	 * secondary cores, so expose only the WFI state.
+	 * secondary cores, so both entries must use WFI. Keep index 1:
+	 * the generic s2idle selector skips fallback index 0, otherwise
+	 * tick_freeze() and timekeeping suspension are never reached.
 	 */
 	if (of_machine_is_compatible("apple,t8140"))
-		apple_idle_driver.state_count = STATE_WFI + 1;
+		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
 
 	return cpuidle_register(&apple_idle_driver, NULL);
 }
