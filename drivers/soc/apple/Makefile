@@ -57,3 +57,6 @@ apple-mcc-y := mcc.o
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
 
 obj-$(CONFIG_APPLE_SART_APIF) += apple-sart-apif.o
+
+# TEST ONLY: J713 display power-down overlay for boot loaders without it.
+obj-$(CONFIG_OF_OVERLAY) += j713-dcp-gate-test.o j713_dcp_gate_test.dtbo.o

@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * TEST ONLY, not for upstream: the J713 display power-down device tree
+ * changes of this series, as an overlay on the boot loader's device tree,
+ * so that they can be tested before the boot loader carries them.
+ */
+/dts-v1/;
+/plugin/;
+
+&pmgr {
+	reg = <0x3 0x80700000 0x0 0x26000>;
+};
+
+&soc {
+	ps_prot: syscon@38079c000 {
+		compatible = "apple,t8132-ps-prot", "syscon";
+		reg = <0x3 0x8079c000 0x0 0x4000>;
+	};
+};
+
+&pmc {
+	pmc_disp0: interface-disp0 {
+		label = "disp0-interface";
+		apple,consumer-switched;
+		apple,bwr-bit = <0>;
+		apple,boost-bit = <0>;
+	};
+};
+
+&ps_disp_sys {
+	apple,consumer-switched;
+};
+
+&ps_disp_fe {
+	apple,consumer-switched;
+};
+
+&ps_disp_cpu {
+	apple,consumer-switched;
+	apple,retention-workaround = <0x2504c 0x3 0x3>, <0x25070 0x1 0x0>;
+};
+
+&dcp_dart {
+	apple,clock-protection = <&ps_prot 42>;
+};
+
+&disp0_dart {
+	apple,clock-protection = <&ps_prot 8>;
+};
+
+&dcp {
+	apple,pmc-interface = <&pmc_disp0>;
+};
