@@ -41,6 +41,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,clock-protection = <&ps_prot 42>;
 		status = "disabled";
 	};
 
@@ -51,6 +52,7 @@
 		interrupts = <AIC_IRQ 678 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		apple,clock-protection = <&ps_prot 8>;
 		status = "disabled";
 	};
 
@@ -70,6 +72,7 @@
 		iommus = <&dcp_dart 23>;
 		power-domains = <&ps_disp_cpu>;
 		dma-noncoherent;
+		apple,pmc-interface = <&pmc_disp0>;
 		status = "disabled";
 
 		disp0_piodma: piodma {

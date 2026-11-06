@@ -135,6 +135,10 @@
 &dcp {
 	apple,panel-width-mm = <290>;
 	apple,panel-height-mm = <188>;
+	/* The DCP's inherited iommu-addresses are validated against 2/2 cells. */
+	#address-cells = <2>;
+	#size-cells = <2>;
+	status = "okay";
 };
 
 /* External displays: both pipes, routed to either USB-C port. */
