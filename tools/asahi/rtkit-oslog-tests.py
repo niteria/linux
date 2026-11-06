@@ -51,7 +51,7 @@ struct apple_rtkit {
  bool oslog_echo;
  int boot_result;
  unsigned iop_power_state, ap_power_state;
- unsigned long endpoints[4];
+ unsigned long endpoints[4], started[4];
  char *syslog_msg_buffer;
  size_t syslog_n_entries, syslog_msg_size;
  int epmap_completion, iop_pwr_ack_completion, ap_pwr_ack_completion, coreanalytics_completion;
