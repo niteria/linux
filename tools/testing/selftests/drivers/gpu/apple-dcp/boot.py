@@ -19,7 +19,7 @@ typedef uint8_t u8;
 #define FIELD_GET(mask,value) (((value) & (mask)) >> __builtin_ctzll(mask))
 #define APPLE_RTKIT_EP_OSLOG 8
 struct buffer { unsigned sentinel; unsigned size; };
-struct apple_rtkit { void *dev; struct buffer oslog_buffer; bool oslog_inherited, sync_syslog_ack; };
+struct apple_rtkit { void *dev; struct buffer oslog_buffer; bool oslog_inherited, sync_syslog_ack, oslog_echo; };
 static unsigned warnings, notifications, requests, acks, errors;
 static u64 observed;
 static bool neo, m5;

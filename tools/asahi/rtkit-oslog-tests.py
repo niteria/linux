@@ -48,6 +48,8 @@ struct apple_rtkit {
  struct apple_rtkit_shmem kdebug_buffer0, kdebug_buffer1, coreanalytics_buffer, pmp_aux_buffer;
  int sync_ack_fifo;
  bool sync_syslog_ack, oslog_inherited, syslog_inherited, crashlog_inherited, crashed, shutting_down;
+ bool oslog_echo;
+ int boot_result;
  unsigned iop_power_state, ap_power_state;
  unsigned long endpoints[4];
  char *syslog_msg_buffer;
@@ -67,6 +69,7 @@ static bool of_machine_is_compatible(const char *s)
 static void set_bit(unsigned n, unsigned long *b) { b[n/64] |= 1UL << (n%64); }
 static void bitmap_zero(unsigned long *b, unsigned n) { memset(b,0,n/8); }
 static void reinit_completion(int *c) { *c=0; }
+static void complete_all(int *c) { *c=1; }
 static void apple_rtkit_rx(void) {}
 static void apple_rtkit_detach_rx(struct apple_rtkit *r) { ++detachments; r->shutting_down=true; }
 static void flush_workqueue(void *w) { (void)w; ++flushes; }
