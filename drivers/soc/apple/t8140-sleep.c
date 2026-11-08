@@ -49,8 +49,10 @@
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/panic_notifier.h>
 #include <linux/platform_device.h>
 #include <linux/smp.h>
+#include <linux/spinlock.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
@@ -2848,6 +2850,82 @@ static int t8132_sleep_last_refusal(struct t8140_sleep *s)
 }
 
 /* macOS's commands after the commit: PMU's 0x2008 back, 0x200e cleared, then "go hib". */
+/* Progress for bring-up, read back after a reset: the PMU keeps this register across one. */
+#define T8132_MARK(n)	(0x53320000 | (n))
+
+static int t8132_sleep_commit(unsigned long unused);
+
+static DEFINE_RAW_SPINLOCK(t8132_mark_lock);
+static u32 t8132_last_mark;
+
+static void t8132_mark_write(struct t8140_sleep *s, u32 data)
+{
+	u32 rx;
+
+	t8132_pmu_cmd(s, T8132_PMU_CMD(T8132_PMU_SECONDS, T8132_PMU_OP_WRITE(4)), &data, &rx, 1,
+		      T8132_PMU_POST_POLL_US);
+}
+
+static void t8132_mark_value(struct t8140_sleep *s, u32 data)
+{
+	unsigned long flags;
+
+	if (s->soc->commit != t8132_sleep_commit)
+		return;
+	raw_spin_lock_irqsave(&t8132_mark_lock, flags);
+	WRITE_ONCE(t8132_last_mark, data);
+	t8132_mark_write(s, data);
+	raw_spin_unlock_irqrestore(&t8132_mark_lock, flags);
+}
+
+static void t8132_mark(struct t8140_sleep *s, u32 n)
+{
+	t8132_mark_value(s, T8132_MARK(n));
+}
+
+/* FNV-1a, folded. The reader hashes the names in sysfs to find the device. */
+static u32 t8132_mark_hash(const char *name)
+{
+	u32 h = 0x811c9dc5;
+
+	for (; *name; name++) {
+		h ^= (u8)*name;
+		h *= 0x01000193;
+	}
+	return h ^ (h >> 16);
+}
+
+/* 0x4P00HHHH: phase P of the suspend, H the hash of the device's name. */
+extern void (*pm_bringup_dev_mark)(struct device *dev, unsigned int phase);
+
+static void t8132_dev_mark(struct device *dev, unsigned int phase)
+{
+	u32 hash = dev ? t8132_mark_hash(dev_name(dev)) & 0xffff : 0;
+
+	if (t8140_sleep)
+		t8132_mark_value(t8140_sleep, 0x40000000 | (phase & 0xf) << 24 | hash);
+}
+
+/*
+ * 0x5PMMHHHH after a device mark, 0x60MMNNNN after one of this driver's: the
+ * panic was in that step, MM the hash of its message.
+ */
+static int t8132_panic_mark(struct notifier_block *nb, unsigned long action, void *msg)
+{
+	u32 last = READ_ONCE(t8132_last_mark), hash = t8132_mark_hash(msg ?: "") & 0xff;
+
+	if (last >> 28 == 0x4)
+		t8132_mark_write(t8140_sleep, 0x50000000 | (last & 0x0f00ffff) | hash << 16);
+	else
+		t8132_mark_write(t8140_sleep, 0x60000000 | (last & 0xffff) | hash << 16);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block t8132_panic_nb = {
+	.notifier_call = t8132_panic_mark,
+};
+
 static void t8132_pmu_go_hib(struct t8140_sleep *s)
 {
 	u32 data, rx[2];
@@ -2936,12 +3014,16 @@ static int t8132_sleep_commit(unsigned long unused)
 	struct t8140_sleep *s = t8140_sleep;
 	int i;
 
+	t8132_mark(s, 0x20);
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	s->cpus_stop_ret = spin_table_stop_parked();
 
+	t8132_mark(s, 0x21);
 	t8132_sleep_lower_io(s);
+	t8132_mark(s, 0x22);
 	t8140_sleep_arm_wd2(s);
 	t8132_sleep_mcc_stop(s);
+	t8132_mark(s, 0x23);
 
 	/* Gates twice, the fourth voter, gates. On macOS the voter reads 0 already. */
 	for (i = 0; i < 2; i++) {
@@ -2970,6 +3052,7 @@ static int t8132_sleep_commit(unsigned long unused)
 
 	t8140_ps_save(s);
 	t8140_sleep_arm_mailbox(s);
+	t8132_mark(s, 0x24);
 
 	writel(1, s->commit);
 
@@ -2979,6 +3062,7 @@ static int t8132_sleep_commit(unsigned long unused)
 	/* Each core's deep WFI comes after the commit, this one last, after its PMU commands. */
 	spin_table_release_stopped();
 	mdelay(T8132_PMU_POST_COMMIT_MS);
+	s->pmu_seconds = T8132_MARK(0x30);
 	t8132_pmu_go_hib(s);
 	t8140_boot_wfi(s);
 }
@@ -3055,26 +3139,34 @@ static int t8140_sleep_enter(suspend_state_t state)
 	struct t8140_sleep *s = t8140_sleep;
 	int ret;
 
+	t8132_mark(s, 0x10);
 	ret = t8140_sleep_refuse(s);
 	if (ret)
 		return ret;
+	t8132_mark(s, 0x11);
 	ret = t8140_sleep_cpus_hold(s);
+	t8132_mark(s, 0x12);
 	/* As on macOS, the display goes off before the GPU. */
 	if (!ret)
 		ret = t8140_display_off(s);
+	t8132_mark(s, 0x13);
 	if (!ret)
 		ret = t8140_sleep_coprocs_check(s);
+	t8132_mark(s, 0x14);
 	if (!ret)
 		ret = t8140_sleep_enclave_tell(s);
+	t8132_mark(s, 0x15);
 	if (ret) {
 		spin_table_unhold_parked();
 		t8140_sleep_stray_restore(s);
 		return ret;
 	}
 	t8140_sleep_coprocs_stop(s, true);
+	t8132_mark(s, 0x16);
 
 	t8140_wake_arm(s);
 	t8140_sleep_match(s);
+	t8132_mark(s, 0x17);
 
 	if (readl(s->wake + WAKE_SLP_DDR))
 		writel(0, s->wake + WAKE_SLP_DDR);
@@ -3087,6 +3179,7 @@ static int t8140_sleep_enter(suspend_state_t state)
 
 	s->cntkctl = read_sysreg(cntkctl_el1);
 	pm_set_resume_via_firmware();
+	t8132_mark(s, 0x18);
 	ret = cpu_suspend(0, s->soc->commit);
 	if (!ret)
 		t8140_sleep_return(s);
@@ -3101,6 +3194,8 @@ static int t8140_sleep_enter(suspend_state_t state)
 /* From here to .end a hang resets the machine. Nobody has to be there to recover it. */
 static int t8140_sleep_begin(suspend_state_t state)
 {
+	if (t8140_sleep)
+		t8132_mark(t8140_sleep, 0x01);
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(t8140_debug_link_cut, false);
 	if (t8140_sleep) {
@@ -3142,6 +3237,7 @@ static int t8140_sleep_prepare(void)
 	struct t8140_sleep *s = t8140_sleep;
 	int i;
 
+	t8132_mark(s, 0x02);
 	if (s->soc->has_ave)
 		t8140_sleep_ave_off(s);
 
@@ -3619,6 +3715,10 @@ static int t8140_sleep_probe(struct platform_device *pdev)
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	t8140_sleep = s;
+	if (s->soc->commit == t8132_sleep_commit) {
+		pm_bringup_dev_mark = t8132_dev_mark;
+		atomic_notifier_chain_register(&panic_notifier_list, &t8132_panic_nb);
+	}
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&t8140_sleep_ops);
 	/* Not when every real sleep would refuse because ANS couldn't come back. */

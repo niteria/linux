@@ -41,6 +41,14 @@
 #include "../base.h"
 #include "power.h"
 
+/* S2R bring-up: where a suspend got to, for a reset that loses the log. */
+void (*pm_bringup_dev_mark)(struct device *dev, unsigned int phase);
+#define PM_BRINGUP_MARK(dev, phase)				\
+	do {							\
+		if (pm_bringup_dev_mark)			\
+			pm_bringup_dev_mark(dev, phase);	\
+	} while (0)
+
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "pm."
 
@@ -1511,6 +1519,7 @@ static void device_suspend_noirq(struct device *dev, pm_message_t state, bool as
 
 	TRACE_DEVICE(dev);
 	TRACE_SUSPEND(0);
+	PM_BRINGUP_MARK(dev, 4);
 
 	dpm_wait_for_subordinate(dev, async);
 
@@ -1706,6 +1715,7 @@ static void device_suspend_late(struct device *dev, pm_message_t state, bool asy
 
 	TRACE_DEVICE(dev);
 	TRACE_SUSPEND(0);
+	PM_BRINGUP_MARK(dev, 3);
 
 	dpm_wait_for_subordinate(dev, async);
 
@@ -1946,6 +1956,7 @@ static void device_suspend(struct device *dev, pm_message_t state, bool async)
 
 	TRACE_DEVICE(dev);
 	TRACE_SUSPEND(0);
+	PM_BRINGUP_MARK(dev, 2);
 
 	dpm_wait_for_subordinate(dev, async);
 
@@ -2202,6 +2213,7 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	bool smart_suspend;
 	int ret = 0;
 
+	PM_BRINGUP_MARK(dev, 1);
 	/*
 	 * If a device's parent goes into runtime suspend at the wrong time,
 	 * it won't be possible to resume the device.  To prevent this we
