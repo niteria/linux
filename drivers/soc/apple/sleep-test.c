@@ -8,6 +8,7 @@
 /* Matched only once its sleep has been tested on hardware. */
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
+	"apple,t8132-sleep",
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
