@@ -474,8 +474,6 @@ struct apple_sleep_soc {
 	unsigned int nwake_names;
 	/* The sources in the wake block's last word */
 	u32 wake_last_word;
-	/* The PCIe host whose port the radio is on, for its PERST#, or NULL */
-	const char *radio_pcie;
 };
 
 struct apple_sleep {
@@ -3526,9 +3524,7 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 	struct device_node *host, *port;
 	struct of_phandle_args args;
 
-	if (!s->soc->radio_pcie)
-		return;
-	host = of_find_compatible_node(NULL, NULL, s->soc->radio_pcie);
+	host = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
 	if (!host)
 		return;
 	if (of_device_is_available(host)) {
@@ -3891,7 +3887,6 @@ static const struct apple_sleep_soc t8140_sleep_soc = {
 	.nwake_names = ARRAY_SIZE(t8140_wake_names),
 	/* 21 sources. Measured: macOS reads 0x001fef77 there. */
 	.wake_last_word = GENMASK(20, 0),
-	.radio_pcie = "apple,t8140-pcie",
 };
 
 static const struct apple_sleep_wake_name t8132_wake_names[] = {
