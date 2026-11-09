@@ -1857,7 +1857,7 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 
 	lockdep_assert_held(&atcphy->lock);
 	if (atcphy->t8103_dummy_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 
 	switch (state) {
 	case ATCPHY_PIPEHANDLER_STATE_USB3:
@@ -1908,7 +1908,7 @@ static int atcphy_park_live_t8103_pipehandler(struct apple_atcphy *atcphy)
 		if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
 			return 0;
 		if (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
-			return -EBUSY;
+			return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 		ret = atcphy_pipehandler_check(atcphy);
 		if (ret)
 			return ret;
@@ -1993,6 +1993,8 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 					   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 		atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		atcphy->pipe_pending = false;
+		/* iBoot leaves it set; a deep sleep resets it, and USB3's PIPE lock needs it. */
+		atcphy_enable_dummy_phy(atcphy);
 		return;
 	}
 
@@ -2498,10 +2500,10 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	guard(mutex)(&atcphy->lock);
 	/* A failed transition may have asserted the PHY resets already. */
 	if (atcphy->mode_dirty || atcphy->pipe_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
 	cfg = &dp_lr_config[lr];
 
@@ -2924,7 +2926,7 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 	if (atcphy->tunnel_clock_on) {
 		/* A failed shutdown retains ownership, but is not a running clock. */
 		if (!atcphy->tunnel_rate)
-			return -EBUSY;
+			return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 		atc_t8122_tunnel_pclk(atcphy, pclk, selector);
 		atcphy->tunnel_rate = rate;
 		return 0;
@@ -2934,7 +2936,7 @@ static int atc_t8122_tunnel_start(struct apple_atcphy *atcphy,
 	    (readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & (BIT(0) | BIT(1))) ||
 	    (readl(atcphy->regs.core + T8122_DP_PCLK_STATUS) & ACIOPHY_AUSPLL_LOCK) ||
 	    ((saved_tx & T8122_PCLK_ENABLES) && (saved_tx & 0xffff) != 0xe001))
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 
 	/*
 	 * Inactive slots use selector zero; all gates stay off during PLL setup.
@@ -3116,7 +3118,7 @@ static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
 	 */
 	if (readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER) & AUSPLL_CLKOUT_MASTER_DRVR_EN ||
 	    readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE) & AUSPLL_APB_CMD_OVERRIDE_REQ)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0, value,
 				 value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY, 10, 10000);
 	if (ret)
@@ -3285,10 +3287,10 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	 */
 	if (outputs & AUSPLL_CLKOUT_MASTER_DRVR_EN || command & AUSPLL_APB_CMD_OVERRIDE_REQ ||
 	    status & ACIOPHY_AUSPLL_LOCK)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if ((gates & (DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE | DPRX_PCLK_ENABLE)) &&
 	    gates != 0x0000e001)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0,
 				 value, value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY,
 				 10, 10000);
@@ -3624,7 +3626,7 @@ static int atcphy_dp_set_rate_t8122(struct apple_atcphy *atcphy, unsigned int li
 		return -ENOLINK;
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->dp_t8122.rate == link_rate)
 		return 0;
 
@@ -3863,12 +3865,12 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 		return -EIO;
 	if ((mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP || cio) &&
 	    atcphy->t8132_suspended)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->pipe_pending || atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 
 	if (atcphy->t8132_common_owned && atcphy->host_active)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/* The PHY stop below takes a DP tunnel pixel clock's PLL with it. */
 	ret = atc_t8122_tunnel_stop(atcphy);
 	if (ret)
@@ -3898,9 +3900,21 @@ static int atcphy_configure_t8132(struct apple_atcphy *atcphy, enum atcphy_mode 
 		goto done;
 	}
 
+	/* A deep sleep took the block's power: it comes back at reset values, clamp not set yet. */
+	if (!core_read32(atcphy, ATCPHY_POWER_CTRL) && !core_read32(atcphy, ATCPHY_POWER_STAT) &&
+	    !(core_read32(atcphy, ATCPHY_MISC) & ~ATCPHY_MISC_LANE_SWAP)) {
+		dev_info(atcphy->dev, "bringup: PHY at reset values, setting the clamp\n");
+		core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_CLAMP_EN);
+		udelay(1);
+	}
 	/* Never reset an inherited common-power epoch to manufacture a cold state. */
-	if (!atcphy_t8132_cold(atcphy))
-		return -EBUSY;
+	if (!atcphy_t8132_cold(atcphy)) {
+		dev_err(atcphy->dev, "bringup: not cold: ctrl %#x stat %#x misc %#x\n",
+			core_read32(atcphy, ATCPHY_POWER_CTRL),
+			core_read32(atcphy, ATCPHY_POWER_STAT),
+			core_read32(atcphy, ATCPHY_MISC));
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
+	}
 	atcphy_usb2_power_on(atcphy);
 	ndelay(500);
 	/* A touched failure retains this epoch without guessing a rollback. */
@@ -3977,16 +3991,16 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	lockdep_assert_held(&atcphy->lock);
 	if (atcphy->t8103_dummy_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132)
 		return atcphy_configure_t8132(atcphy, mode);
 	if (atcphy->pipe_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->usb_off_pending && mode != APPLE_ATCPHY_MODE_OFF)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas &&
 	    (mode != atcphy->mode || atcphy->mode_dirty)) {
 		atcphy->mode_dirty = true;
@@ -4332,8 +4346,12 @@ static int atcphy_usb2_init(struct phy *phy)
 
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
+	dev_info(atcphy->dev, "bringup: usb2_init mode %d typec %d dirty %d pipe %d pending %d owned %d host %d susp %d failed %d off_pending %d\n",
+		 atcphy->mode, atcphy->typec_mode, atcphy->mode_dirty, atcphy->pipe_state,
+		 atcphy->pipe_pending, atcphy->t8132_common_owned, atcphy->host_active,
+		 atcphy->t8132_suspended, atcphy->t8132_failed, atcphy->usb_off_pending);
 	if (atcphy->usb_off_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->pipe_pending &&
 	    (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)) {
 		int ret = atcphy_park_pipehandler(atcphy, false);
@@ -4463,7 +4481,7 @@ static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
 	 */
 	/* A failed lane/domain transition must be restored before routing PIPE. */
 	if (atcphy->mode_dirty)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/* dwc3 can select its role before the debounced Type-C mux update. */
 	if (atcphy->t8103_usb3_workaround &&
 	    atcphy->mode == APPLE_ATCPHY_MODE_OFF) {
@@ -4498,7 +4516,7 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	atcphy_restore_after_pd_off(atcphy);
 
 	if (atcphy->usb_off_pending)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 
 	if (atcphy->t8132_ss &&
 	    (atcphy->mode == APPLE_ATCPHY_MODE_USB3 || atcphy->mode == APPLE_ATCPHY_MODE_USB3_DP) &&
@@ -4555,7 +4573,7 @@ static int atcphy_usb3_exit(struct phy *phy)
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->t8132_common_owned || atcphy->t8132_failed || atcphy->pipe_pending ||
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	return 0;
 }
 
@@ -4757,7 +4775,7 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 	    atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
 	    atcphy->mode != APPLE_ATCPHY_MODE_TBT) {
 		if (rate)
-			return -EBUSY;
+			return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 		if ((atcphy->tunnel_users & BIT(dpin)) &&
 		    atcphy->tunnel_source[dpin] != source)
 			return -ESTALE;
@@ -4792,13 +4810,13 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
 	    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (atcphy->tunnel_clock_on && !atcphy->tunnel_rate)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/* Keep this owner if a failed start cannot shut the PLL down. */
 	if ((atcphy->tunnel_users & BIT(1 - dpin)) &&
 	    atcphy->tunnel_source[1 - dpin] == source)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if ((atcphy->tunnel_users & BIT(dpin)) &&
 	    atcphy->tunnel_dpin_rate[dpin] == rate && atcphy->tunnel_rate)
 		return 0;
@@ -4871,7 +4889,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return 0;
 	}
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (apple_atc_tunnel_is_t8103_style()) {
 		ret = atc_tunnel_start_t8103(atcphy, rate);
 		if (!ret)
@@ -4898,7 +4916,7 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 	atcphy = phy_get_drvdata(phy);
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	if (!atcphy->tunnel_clock_on) {
 		atc_tunnel_wake_t8103(atcphy);
 		atc_tunnel_pclk_t8103(atcphy, 0);
@@ -5637,7 +5655,7 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	/* A re-probe after failed role shutdown must leave the live PIPE alone. */
 	if (!atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF &&
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 
 	ret = atcphy_mux_check(atcphy, target_mode);
 	if (ret)
@@ -6699,13 +6717,13 @@ static int atcphy_suspend_noirq(struct device *dev)
 		dev_err(dev, "USB changed for the sleep (mode %d, PIPE %d, host %d): refusing it\n",
 			atcphy->mode, atcphy->pipe_state, atcphy->host_active);
 		atcphy->sleep_ret = -EBUSY;
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	}
 	ret = atcphy_sleep_park_pipe(atcphy);
 	if (ret) {
 		dev_err(dev, "PIPE not parked for the sleep: %d, refusing it\n", ret);
 		atcphy->sleep_ret = -EBUSY;
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	}
 
 	ret = atcphy_controller_hibernate(atcphy);
@@ -6739,6 +6757,9 @@ static int atcphy_resume_noirq(struct device *dev)
 	int ret = 0;
 
 	guard(mutex)(&atcphy->lock);
+	/* A real sleep took T8132's PHY state behind its power domain's back. */
+	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132 && pm_resume_via_firmware())
+		WRITE_ONCE(atcphy->pd_was_off, true);
 	if (!atcphy->hibernated) {
 		atcphy_sleep_lost_dp(atcphy);
 		return 0;
@@ -6821,7 +6842,7 @@ int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 			"USB controller stops for the sleep: mode %d, PIPE %d, host %d\n",
 			atcphy->mode, atcphy->pipe_state, atcphy->host_active);
 
-	return -EBUSY;
+	return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_prepare);
 
@@ -6868,7 +6889,7 @@ static int atcphy_suspend(struct device *dev)
 	guard(mutex)(&atcphy->lock);
 	/* An incomplete common epoch has no qualified sleep handoff. */
 	if (atcphy->mode_dirty)
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/*
 	 * An active one survives suspend-to-idle while a host runs on it: DWC3
 	 * then keeps the power domain on across system sleep, so the link stays
@@ -6876,7 +6897,7 @@ static int atcphy_suspend(struct device *dev)
 	 */
 	if (atcphy->t8132_common_owned &&
 	    (!atcphy->host_active || pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
-		return -EBUSY;
+		return (pr_err("atc-ebusy %s:%d\n", __func__, __LINE__), -EBUSY);
 	/* Do not admit a new epoch after this check and before resume. */
 	atcphy->t8132_suspended = true;
 

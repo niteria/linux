@@ -581,6 +581,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	{
+		u32 mbse = 0;
+		u8 mbsw[8] = {};
+		int r1 = apple_smc_read_u32(smc, SMC_KEY(MBSE), &mbse);
+		int r2 = apple_smc_read(smc, SMC_KEY(MBSW), mbsw, sizeof(mbsw));
+
+		dev_info(dev, "bringup: at probe MBSE %#x (%d), MBSW %8ph (%d)\n", mbse, r1, mbsw, r2);
+	}
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
