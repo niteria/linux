@@ -34,6 +34,7 @@
 
 #include "../../../arch/arm64/boot/dts/apple/t8132-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-j713-pmgr.dtsi"
+#include "../../../arch/arm64/boot/dts/apple/t8132-j713-usb4-pmgr.dtsi"
 #include "../../../arch/arm64/boot/dts/apple/t8132-memory.dtsi"
 
 &mcc {
