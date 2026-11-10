@@ -2300,6 +2300,23 @@ int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_noirq);
 
+/* Power is back, the CPU is stopped, and poweroff() discarded the old session. */
+int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx)
+{
+	int ret;
+
+	ret = apple_rtkit_reinit(rtk);
+	if (ret)
+		return ret;
+	/* The mailbox registers may only be clocked once @start has run. */
+	ret = start(ctx);
+	if (ret)
+		return ret;
+	apple_mbox_set_recv_enabled(rtk->mbox, true);
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_cold_restart);
+
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {
 	int ret;

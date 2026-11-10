@@ -257,6 +257,9 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk);
 
 int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 
+/* After poweroff and a power cycle, restart the CPU, then restore the mailbox. */
+int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
+
 /*
  * Put the co-processor into idle mode
  */
