@@ -383,6 +383,8 @@ struct apple_dart {
 	u32 host_resumes : 1;
 	/* Powered down by its DCP across a real sleep: see apple_dart_host_power_on(). */
 	u32 host_off_slept : 1;
+	/* Reset and restored, its address filter written, at every power-up. */
+	u32 restore_on_power_up : 1;
 	bool commands_gated;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
@@ -4586,16 +4588,17 @@ static bool apple_dart_dapf_holds(struct apple_dart *dart)
 }
 
 /*
- * After a power-off, before any consumer's firmware starts. Not while it's kept, and not
- * while it's locked.
+ * After a power-off, before any consumer's firmware starts. Not while it's kept, unless
+ * @always, and not while it's locked. Each entry's config word goes last, after its
+ * streams, as macOS writes it.
  */
-static void apple_dart_dapf_replay(struct apple_dart *dart)
+static void apple_dart_dapf_replay(struct apple_dart *dart, bool always)
 {
 	unsigned int i;
 
 	if (!dart->dapf_count)
 		return;
-	if (apple_dart_dapf_holds(dart))
+	if (!always && apple_dart_dapf_holds(dart))
 		return;
 	if (readl(dart->regs + DART_DAPF_LOCK) & DART_DAPF_LOCKED) {
 		dev_warn(dart->dev, "DAPF locked after the sleep: not replayed\n");
@@ -4608,8 +4611,8 @@ static void apple_dart_dapf_replay(struct apple_dart *dart)
 		writel(0, entry + 0x04);
 		writeq(dart->dapf_ranges[2 * i], entry + 0x08);
 		writeq(dart->dapf_ranges[2 * i + 1], entry + 0x10);
-		writel(DART_DAPF_CONFIG, entry + 0x00);
 		writel(dart->dapf_r20[i], entry + 0x20);
+		writel(DART_DAPF_CONFIG, entry + 0x00);
 	}
 	/* Its consumer's firmware faults on its first access without it: say so plainly. */
 	if (!apple_dart_dapf_holds(dart)) {
@@ -4879,6 +4882,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+	dart->restore_on_power_up = of_property_read_bool(dev->of_node,
+							  "apple,restore-on-power-up");
 	if (tunneled) {
 		dart->tunables = devm_apple_tunable_parse(dev, dev->of_node,
 							  "apple,tunable", res);
@@ -6023,7 +6028,13 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	if (dart->locked)
 		return 0;
 
-	if (apple_dart_state_retained(dart)) {
+	/*
+	 * Not for a DART restored at every power-up, as macOS's SPTM does (its
+	 * t8110dart powerup): T8140's ISP DART keeps Linux's values through a wake
+	 * that kept DRAM up, but its address filter takes effect only once written
+	 * again, and the firmware's first access through it faults.
+	 */
+	if (!dart->restore_on_power_up && apple_dart_state_retained(dart)) {
 		/* Nothing was lost, only drop what the TLBs may still hold. */
 		if (!dart->reset_incomplete)
 			return apple_dart_invalidate_each_stream(dart);
@@ -6061,7 +6072,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	}
 
 	/* The address filter went with the same power-off, and so may these. */
-	apple_dart_dapf_replay(dart);
+	apple_dart_dapf_replay(dart, dart->restore_on_power_up);
 	if (dart->resume_tunables) {
 		unsigned int changed = apple_dart_apply_tunables(dart, dart->resume_tunables);
 
@@ -6112,7 +6123,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 			dev_dbg(dev, "restored after sleep\n");
 	}
 	if (pm_resume_via_firmware())
-		apple_dart_dapf_replay(dart);
+		apple_dart_dapf_replay(dart, false);
 
 	return ret;
 }

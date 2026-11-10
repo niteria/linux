@@ -613,8 +613,8 @@ struct apple_sleep {
 	int radio_perst;
 	bool radio_perst_low;
 	bool returned;
-	/* This return was the first from the deep path: later sleeps keep DRAM up. */
-	bool slp_ddr_now_ready;
+	/* This wake came back down the deep path, not the DRAM-kept one. */
+	bool deep_ran;
 	/* This sleep's wake came from the SMC's sources alone. */
 	bool smc_woke_alone;
 	/* T8132: what macOS polls off after its complex words, still on at that point. */
@@ -675,13 +675,6 @@ static bool sleep_slp_ddr_usb;
 static void __iomem *sleep_slp_ddr_word;
 
 /*
- * The SLP_DDR wake runs on the SoC-side state the system left. After a Linux boot it stalls in
- * the sleep engine, and once one deep sleep has rebuilt that state it gets through every time.
- * So the word stays clear, whatever the host votes, until a wake shows the deep path ran.
- */
-static bool sleep_slp_ddr_ready;
-
-/*
  * A coprocessor that runs through a sleep crashed. The AOP is the always-on master SLP_DDR keeps
  * DRAM up for: after its firmware crashed, the next SLP_DDR wake stalled in the sleep engine,
  * while the deep path doesn't need it. Nothing restarts it short of a reboot.
@@ -696,7 +689,7 @@ static void sleep_slp_ddr_write(void)
 	if (!sleep_slp_ddr_word)
 		return;
 	val = readl(sleep_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (sleep_slp_ddr_usb && sleep_slp_ddr_ready && !sleep_slp_ddr_crashed)
+	if (sleep_slp_ddr_usb && !sleep_slp_ddr_crashed)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, sleep_slp_ddr_word);
 }
@@ -728,25 +721,6 @@ void apple_sleep_coproc_crashed(struct device *dev)
 	dev_warn(apple_sleep->dev, "%s crashed: later sleeps take the deep path\n", dev_name(dev));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
-
-/*
- * After the camera ran, the next SLP_DDR wake stalled in the sleep engine, 6 of 6 times, whether
- * the ISP's firmware was stopped at the sleep or about 50 s before it; a deep sleep rebuilds
- * what it leaves, as after boot. So from the ISP's start, the next sleep takes the deep path.
- */
-void apple_sleep_next_deep(struct device *dev)
-{
-	if (!apple_sleep)
-		return;
-	scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
-		if (!sleep_slp_ddr_ready)
-			return;
-		sleep_slp_ddr_ready = false;
-		sleep_slp_ddr_write();
-	}
-	dev_info(apple_sleep->dev, "%s ran: the next sleep takes the deep path\n", dev_name(dev));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_next_deep);
 
 static bool sleep_debug_link_cut;
 
@@ -3120,14 +3094,8 @@ static void apple_sleep_return(struct apple_sleep *s)
 	if (s->soc->rewake)
 		s->soc->rewake(s);
 
-	/* Only C2S turns AP_TMM on: the deep path ran, so the held vote applies from now on. */
-	if (!sleep_slp_ddr_ready && sleep_ps_woke_on(s, s->soc->ps.ap_tmm)) {
-		scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
-			sleep_slp_ddr_ready = true;
-			sleep_slp_ddr_write();
-		}
-		s->slp_ddr_now_ready = true;
-	}
+	/* Only C2S turns AP_TMM on. */
+	s->deep_ran = sleep_ps_woke_on(s, s->soc->ps.ap_tmm);
 
 	val = readl(s->ps + s->soc->ps.sep);
 	if (val & PS_DEV_DISABLE)
@@ -3321,10 +3289,8 @@ static void apple_sleep_report(void)
 
 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
 		 s->resumes_before, s->resumes_after);
-	if (s->slp_ddr_now_ready) {
-		s->slp_ddr_now_ready = false;
-		dev_info(s->dev, "the deep path ran: later sleeps keep DRAM up for the USB host\n");
-	}
+	if (s->deep_ran)
+		dev_info(s->dev, "the deep path ran\n");
 	for (i = 0; i < s->soc->nwake_names; i++) {
 		u32 id = names[i].id;
 
