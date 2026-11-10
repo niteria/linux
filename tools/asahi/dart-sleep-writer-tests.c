@@ -24,6 +24,8 @@ struct apple_dart {
 	unsigned int sleep_writers;
 	int managed_lock;
 	struct apple_dart_sleep *sleep_record;
+	void *cio;
+	bool cio_active, cio_violation;
 };
 /* ACTUAL_FUNCTIONS */
 int main(void)
@@ -48,5 +50,11 @@ int main(void)
 	assert(!apple_dart_sleep_writer_get(&d));
 	apple_dart_sleep_writer_put(&d);
 	assert(!d.sleep_writers);
-	puts("DART writer gate: nested/in-flight/closed/legacy invariants PASS");
+	d = (struct apple_dart){ .cio = &s, .cio_active = true };
+	assert(!apple_dart_sleep_writer_get(&d) && d.sleep_writers == 1);
+	assert(apple_dart_sleep_close(&d) == -EBUSY);
+	apple_dart_sleep_writer_put(&d);
+	assert(!apple_dart_sleep_close(&d));
+	assert(apple_dart_sleep_writer_get(&d) == -EBUSY && d.cio_violation);
+	puts("DART writer gate: nested/in-flight/closed/legacy/CIO invariants PASS");
 }

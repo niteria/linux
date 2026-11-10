@@ -22,12 +22,14 @@ static int apple_dart_sleep_writer_get(struct apple_dart *dart)
 	unsigned long flags;
 	int ret = 0;
 
-	if (!dart->managed_sids)
+	if (!dart->managed_sids && !dart->cio)
 		return 0;
 	spin_lock_irqsave(&dart->managed_lock, flags);
 	if (dart->sleep_closed) {
 		if (dart->sleep_record)
 			WRITE_ONCE(dart->sleep_record->result, -EUCLEAN);
+		if (dart->cio_active)
+			dart->cio_violation = true;
 		ret = -EBUSY;
 	} else if (dart->sleep_writers == UINT_MAX) {
 		ret = -EOVERFLOW;
@@ -42,7 +44,7 @@ static void apple_dart_sleep_writer_put(struct apple_dart *dart)
 {
 	unsigned long flags;
 
-	if (!dart->managed_sids)
+	if (!dart->managed_sids && !dart->cio)
 		return;
 	spin_lock_irqsave(&dart->managed_lock, flags);
 	dart->sleep_writers--;
@@ -67,7 +69,7 @@ static int apple_dart_sleep_close(struct apple_dart *dart)
 /* A void unmap/free caller may release backing memory when we return. */
 static void __noreturn apple_dart_sleep_release_failed(void)
 {
-	panic("J713 radio: DMA state cannot be released safely");
+	panic("Apple DART: DMA state cannot be released safely");
 }
 
 static int apple_dart_sleep_valid(struct apple_dart_sleep *sleep)

@@ -32,6 +32,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/dart-cio.h>
 #include <linux/soc/apple/dart-sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/of.h>
@@ -462,6 +463,8 @@ struct apple_dart {
 	/* Serialize owned TCR publication against IRQ quarantine. */
 	spinlock_t managed_lock;
 	struct apple_dart_sleep *sleep_record;
+	struct apple_dart_cio *cio;
+	bool cio_active, cio_violation;
 	unsigned int sleep_writers;
 	bool sleep_closed;
 
@@ -503,6 +506,7 @@ struct apple_dart {
 static int apple_dart_sleep_writer_get(struct apple_dart *dart);
 static void apple_dart_sleep_writer_put(struct apple_dart *dart);
 static void __noreturn apple_dart_sleep_release_failed(void);
+static int apple_dart_cio_init(struct apple_dart *dart, resource_size_t base, resource_size_t size);
 
 #ifndef MODULE
 static struct kexec_blocker apple_dart_radio_kexec = {
@@ -3154,7 +3158,8 @@ static void apple_dart_release_device(struct device *dev)
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
 	for_each_stream_map(j, cfg, stream_map) {
-		if (READ_ONCE(stream_map->dart->sleep_record))
+		if (READ_ONCE(stream_map->dart->sleep_record) ||
+		    READ_ONCE(stream_map->dart->cio_active))
 			apple_dart_sleep_release_failed();
 		/* Borrowed display roots stay exactly as the DCP left them. */
 		if (!stream_map->dart->locked || apple_dart_has_borrowed(stream_map->dart))
@@ -3229,7 +3234,8 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 		return;
 	}
 	for_each_stream_map(i, dart_domain, map) {
-		if (map->dart->managed_sids || READ_ONCE(map->dart->sleep_record))
+		if (map->dart->managed_sids || READ_ONCE(map->dart->sleep_record) ||
+		    READ_ONCE(map->dart->cio_active))
 			return;
 		if (!map->dart->locked)
 			continue;
@@ -4799,6 +4805,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dart->managed_sids = BIT(1) | BIT(2);
 	}
 	spin_lock_init(&dart->managed_lock);
+	ret = apple_dart_cio_init(dart, res->start, resource_size(res));
+	if (ret)
+		return ret;
 	dart->preserve_display = j713_display || j713_dcpext || j713_dispext;
 	dart->dispext = j713_dispext;
 	dart->power_gated = j713_dispext;
@@ -5613,6 +5622,7 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 };
 
 #include "apple-dart-sleep.c"
+#include "apple-dart-cio.c"
 
 static void apple_dart_save_state(struct apple_dart *dart)
 {
@@ -5809,8 +5819,8 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
-	/* Native radio owner restores before the PCI functions resume. */
-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+	/* Native owners restore after host clocks and before their requesters. */
+	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
 		return 0;
 
 	dart->tunnel_state_restored = false;
@@ -5963,8 +5973,8 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	unsigned int sid, idx;
 	int ret;
 
-	/* Native radio owner restores before the PCI functions resume. */
-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+	/* Native owners restore after host clocks and before their requesters. */
+	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
 		return 0;
 
 	/* No reset or restore: see apple_dart_suspend(). */
@@ -6071,7 +6081,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 	int ret;
 
 	/* Its host restores every register after the native port clocks return. */
-	if (dart->managed_sids && READ_ONCE(dart->sleep_record))
+	if ((dart->managed_sids && READ_ONCE(dart->sleep_record)) || READ_ONCE(dart->cio_active))
 		return pm_runtime_force_resume(dev);
 
 	/*
