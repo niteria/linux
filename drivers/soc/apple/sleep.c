@@ -44,6 +44,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irqchip/irq-apple-aic.h>
+#include <linux/ktime.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -176,7 +177,9 @@ struct aura_s2r_mailbox {
 #define HPM_CMD_SSPS		0x53505353
 #define HPM_CMD_COLD_RESET	0x64696147
 #define HPM_SSPS_S3		3
-#define HPM_RESET_MS		1000
+/* The first look after the reset, and how long a contract that never seemed to go is trusted to have gone. */
+#define HPM_RESET_FIRST_MS	50
+#define HPM_RESET_FLOOR_MS	1000
 #define HPM_PAGE_POWER_STATUS	0x3f
 #define HPM_POWER_CONNECTED	BIT(0)
 #define HPM_POWER_TYPEC_MODE	GENMASK(3, 2)
@@ -678,6 +681,13 @@ static void __iomem *sleep_slp_ddr_word;
  */
 static bool sleep_slp_ddr_ready;
 
+/*
+ * A coprocessor that runs through a sleep crashed. The AOP is the always-on master SLP_DDR keeps
+ * DRAM up for: after its firmware crashed, the next SLP_DDR wake stalled in the sleep engine,
+ * while the deep path doesn't need it. Nothing restarts it short of a reboot.
+ */
+static bool sleep_slp_ddr_crashed;
+
 static void sleep_slp_ddr_write(void)
 {
 	u32 val;
@@ -686,7 +696,7 @@ static void sleep_slp_ddr_write(void)
 	if (!sleep_slp_ddr_word)
 		return;
 	val = readl(sleep_slp_ddr_word) & ~WAKE_SLP_DDR_USB;
-	if (sleep_slp_ddr_usb && sleep_slp_ddr_ready)
+	if (sleep_slp_ddr_usb && sleep_slp_ddr_ready && !sleep_slp_ddr_crashed)
 		val |= WAKE_SLP_DDR_USB;
 	writel(val, sleep_slp_ddr_word);
 }
@@ -698,6 +708,45 @@ void apple_sleep_usb_slp_ddr(bool up)
 	sleep_slp_ddr_write();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_slp_ddr);
+
+/*
+ * From RTKit, for every firmware crash. One this driver stops and restarts around each sleep
+ * doesn't run through it; for any other, every later sleep takes the deep path. It may come
+ * from a poll with interrupts off, so the table is read without its lock: entries only change
+ * at registration.
+ */
+void apple_sleep_coproc_crashed(struct device *dev)
+{
+	if (!apple_sleep || apple_sleep_coproc_find(dev))
+		return;
+	scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
+		if (sleep_slp_ddr_crashed)
+			return;
+		sleep_slp_ddr_crashed = true;
+		sleep_slp_ddr_write();
+	}
+	dev_warn(apple_sleep->dev, "%s crashed: later sleeps take the deep path\n", dev_name(dev));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_crashed);
+
+/*
+ * After the camera ran, the next SLP_DDR wake stalled in the sleep engine, 6 of 6 times, whether
+ * the ISP's firmware was stopped at the sleep or about 50 s before it; a deep sleep rebuilds
+ * what it leaves, as after boot. So from the ISP's start, the next sleep takes the deep path.
+ */
+void apple_sleep_next_deep(struct device *dev)
+{
+	if (!apple_sleep)
+		return;
+	scoped_guard(spinlock_irqsave, &sleep_slp_ddr_lock) {
+		if (!sleep_slp_ddr_ready)
+			return;
+		sleep_slp_ddr_ready = false;
+		sleep_slp_ddr_write();
+	}
+	dev_info(apple_sleep->dev, "%s ran: the next sleep takes the deep path\n", dev_name(dev));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_next_deep);
 
 static bool sleep_debug_link_cut;
 
@@ -1877,48 +1926,65 @@ static int sleep_hpm_sleep(struct apple_sleep *s)
  * Left to finish across the commit, that sometimes failed: neither side had a contract or
  * saw the other, and no VDM got through until a replug. Returns the ms it took.
  */
-static int sleep_hpm_wait_contract(struct apple_sleep *s)
+static int sleep_hpm_wait_contract(struct apple_sleep *s, int *gone_ms)
 {
-	bool wake = true;
+	ktime_t start = ktime_get();
+	bool wake = true, up;
 	u32 val = 0;
 	int ms, ret;
 
-	for (ms = 0; ms < HPM_CONTRACT_MS; ms += 10) {
+	/*
+	 * It reads back as before for a moment after the reset. Count it as back once it was
+	 * seen gone (no contract, or no answer while the controller restarts), or after the
+	 * floor if it never seemed to go.
+	 */
+	*gone_ms = -1;
+	mdelay(HPM_RESET_FIRST_MS);
+	for (;;) {
+		ms = ktime_ms_delta(ktime_get(), start);
+		if (ms >= HPM_CONTRACT_MS)
+			return -ETIMEDOUT;
 		ret = wake ? sleep_hpm_cmd(s, SPMI_OP_WAKEUP, 0, NULL, NULL) : 0;
 		if (!ret)
 			ret = sleep_hpm_select(s, HPM_PAGE_POWER_STATUS);
 		if (!ret)
 			ret = sleep_hpm_cmd(s, SPMI_OP_EXT_READ(4), HPM_REG_DATA, NULL, &val);
-		if (!ret && (val & HPM_POWER_CONNECTED) &&
-		    FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD)
+		up = !ret && (val & HPM_POWER_CONNECTED) &&
+		     FIELD_GET(HPM_POWER_TYPEC_MODE, val) == HPM_POWER_TYPEC_PD;
+		if (!up && *gone_ms < 0)
+			*gone_ms = ms;
+		if (up && (*gone_ms >= 0 || ms >= HPM_RESET_FLOOR_MS))
 			return ms;
 		wake = ret;
 		mdelay(10);
 	}
+}
 
-	return -ETIMEDOUT;
+/* A live debug link holds the debug switch domain on. */
+static bool sleep_debug_link_up(struct apple_sleep *s)
+{
+	return s->hpm_spmi &&
+	       FIELD_GET(PS_ACTUAL, readl(s->ps_aon + s->soc->ps_aon_debug_switch));
 }
 
 /*
  * The debug link stays up with the ATC0 domains off, and it holds the debug domains
  * active, which macOS has idle. The only known way to end it is the port controller's
- * cold reset. To the SMC that's a cable pulled: it queues the port's events and records
- * them as wake reasons. So it has to come before the SMC's AP idle notice, not after, or
- * SMC.OutboxNotEmpty is up at the commit, and so does the partner's new contract.
- * tipd rearms the link after a refusal.
+ * cold reset. To the SMC that's a cable pulled: it records the port's events as wake
+ * reasons once it has been warned of the sleep, and wakes the AP right after the commit.
+ * So the SMC's driver warns it only after this. tipd rearms the link after a refusal.
  */
 static bool apple_sleep_usb_down(struct apple_sleep *s)
 {
 	u32 cmd = HPM_CMD_COLD_RESET;
 	u32 enable;
-	int i, ret, ms;
+	int i, ret, ms, gone;
 
 	if (s->usb_down_ran)
 		return false;
 	s->usb_down_ran = true;
 
-	if (!s->hpm_spmi ||
-	    !FIELD_GET(PS_ACTUAL, readl(s->ps_aon + s->soc->ps_aon_debug_switch)))
+	if (!sleep_debug_link_up(s))
 		return false;
 
 	dev_info(s->dev, "debug link: cutting it for the sleep\n");
@@ -1934,11 +2000,10 @@ static bool apple_sleep_usb_down(struct apple_sleep *s)
 		if (ret)
 			break;
 		WRITE_ONCE(sleep_debug_link_cut, true);
-		mdelay(HPM_RESET_MS);
-		ms = sleep_hpm_wait_contract(s);
+		ms = sleep_hpm_wait_contract(s, &gone);
 		if (ms >= 0) {
-			dev_info(s->dev, "debug link: contract back %d ms after reset %d\n",
-				 HPM_RESET_MS + ms, i);
+			dev_info(s->dev, "debug link: contract back %d ms after reset %d (gone at %d ms)\n",
+				 ms, i, gone);
 			break;
 		}
 		dev_warn(s->dev, "debug link: no contract with the partner after reset %d\n", i);
@@ -1958,6 +2023,14 @@ bool apple_sleep_debug_link_cut(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
 
+bool apple_sleep_debug_link_up(void)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	return s && !s->usb_down_ran && sleep_debug_link_up(s);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_debug_link_up);
+
 /*
  * macOS takes the wake for a lid closing during the sleep as a dark one: every driver wakes,
  * the display stays off, and the root domain sleeps again as soon as it sees the lid closed.
@@ -1972,6 +2045,22 @@ void apple_sleep_lid_closed_wake(void)
 	pm_set_dark_wake();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
+
+/*
+ * The SMC woke the AP for the port alone, and this sleep cut the debug link: the cut's own
+ * events. Sleep again. The link stays down until tipd rearms it at a full wake, so the next
+ * entry doesn't cut it.
+ */
+void apple_sleep_debug_link_cut_wake(void)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->smc_woke_alone || !READ_ONCE(sleep_debug_link_cut))
+		return;
+	dev_info(s->dev, "debug link: its cut woke the sleep: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_wake);
 
 /*
  * The radio's link and the engine that starts it, in macOS's order, measured on one
@@ -3128,6 +3217,10 @@ static int apple_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(sleep_debug_link_cut, false);
+	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
+	if (state != PM_SUSPEND_MEM)
+		return 0;
+
 	if (apple_sleep) {
 		apple_sleep->apcie_port_stopped = false;
 		apple_sleep->usb_down_ran = false;
@@ -3142,7 +3235,8 @@ static int apple_sleep_begin(suspend_state_t state)
 
 static void apple_sleep_end(void)
 {
-	writel(0, apple_sleep->wdt + WDT_WD2_CTL);
+	if (pm_suspend_via_firmware())
+		writel(0, apple_sleep->wdt + WDT_WD2_CTL);
 }
 
 /*

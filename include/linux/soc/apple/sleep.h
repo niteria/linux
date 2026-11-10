@@ -108,6 +108,9 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
  */
 bool apple_sleep_debug_link_cut(void);
 
+/* This sleep will end the debug link: for the SMC's driver, which warns the SMC after it. */
+bool apple_sleep_debug_link_up(void);
+
 /*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the lid alone, and the
  * lid reads closed. If nothing else woke the SoC, the PM core goes back to sleep once every
@@ -115,8 +118,20 @@ bool apple_sleep_debug_link_cut(void);
  */
 void apple_sleep_lid_closed_wake(void);
 
+/*
+ * From the SMC's driver, in its noirq resume: the SMC woke the AP for the port alone. If
+ * this sleep cut the debug link and nothing else woke the SoC, it's a dark wake.
+ */
+void apple_sleep_debug_link_cut_wake(void);
+
 /* The radio's host has its port back after a real sleep, so the next commit may stop it. */
 void apple_sleep_radio_port_up(void);
+
+/* From RTKit: this coprocessor's firmware crashed. */
+void apple_sleep_coproc_crashed(struct device *dev);
+
+/* This device ran: the next sleep takes the deep path, as the first of a boot does. */
+void apple_sleep_next_deep(struct device *dev);
 
 /* After a deep sleep, put back the pins it reset. ANS's driver calls it before the run bit. */
 void apple_sleep_restore_pins(void);
@@ -221,11 +236,28 @@ static inline bool apple_sleep_debug_link_cut(void)
 	return false;
 }
 
+static inline bool apple_sleep_debug_link_up(void)
+{
+	return false;
+}
+
 static inline void apple_sleep_lid_closed_wake(void)
 {
 }
 
+static inline void apple_sleep_debug_link_cut_wake(void)
+{
+}
+
 static inline void apple_sleep_radio_port_up(void)
+{
+}
+
+static inline void apple_sleep_coproc_crashed(struct device *dev)
+{
+}
+
+static inline void apple_sleep_next_deep(struct device *dev)
 {
 }
 
