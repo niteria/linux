@@ -380,6 +380,31 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 	return ret;
 }
 
+/* Check the physical result of genpd's void syscore suspend/resume helpers. */
+int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
+{
+	struct generic_pm_domain *genpd;
+	struct apple_pmgr_ps *ps;
+	u32 value, mask = APPLE_PMGR_PS_LEVELS | APPLE_PMGR_BUSY |
+			  APPLE_PMGR_RESET | APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE;
+
+	if (!domain_dev->pm_domain)
+		return -EINVAL;
+	genpd = pd_to_genpd(domain_dev->pm_domain);
+	if (genpd->power_on != apple_pmgr_ps_power_on ||
+	    !(genpd->flags & GENPD_FLAG_IRQ_SAFE))
+		return -EOPNOTSUPP;
+	ps = genpd_to_apple_pmgr_ps(genpd);
+	if (ps->firmware_owned || ps->inherited_on)
+		return -EPERM;
+	if (!on)
+		mask |= APPLE_PMGR_AUTO_ENABLE;
+	return regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, value,
+					      (value & mask) == (on ? APPLE_PMGR_PS_ALL_ON : 0),
+					      1, APPLE_PMGR_PS_PARENT_TIMEOUT);
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_verify_state);
+
 /**
  * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
  * @np: the power state node, as named by a consumer's power-domains
