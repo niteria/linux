@@ -413,7 +413,7 @@ static int tb_pci_host_pre_activate(struct tb_tunnel *tunnel)
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
 	/* Only the tunnel starting at the host owns its native PCIe port. */
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_pre_activate)
 		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
@@ -424,7 +424,7 @@ int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_post_activate) {
 		/* Also unwind a hook that fails after partial host setup. */
@@ -440,7 +440,7 @@ int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 	int ret = 0;
 
 	/* Firmware tunnels discovered during resume do not own host state. */
-	if (!tunnel->host_pci_activated)
+	if (tunnel->sleep_replay || !tunnel->host_pci_activated)
 		return 0;
 	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->pci_tunnel_deactivate)
@@ -1416,6 +1416,12 @@ static void tb_dp_dprx_work(struct work_struct *work)
 	 * safe to access.
 	 */
 	mutex_lock(&tb->lock);
+	if (tunnel->sleep_paused) {
+		mutex_unlock(&tb->lock);
+		tb_tunnel_put(tunnel);
+		tb_domain_put(tb);
+		return;
+	}
 	if (!tunnel->dprx_canceled && tb_dp_host_awaits_display(tunnel)) {
 		/*
 		 * Nothing drives the tunnel yet, so DPRX cannot be done: leave
@@ -1537,7 +1543,7 @@ void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops;
 
-	if (!tunnel->host_dp_activated)
+	if (tunnel->sleep_replay || !tunnel->host_dp_activated)
 		return;
 	tunnel->host_dp_activated = false;
 	ops = tunnel->tb->nhi->ops;
@@ -1565,18 +1571,22 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		paths = tunnel->paths;
 		last = paths[TB_DP_VIDEO_PATH_OUT]->path_length - 1;
 
-		tb_dp_port_set_hops(tunnel->src_port,
-			paths[TB_DP_VIDEO_PATH_OUT]->hops[0].in_hop_index,
-			paths[TB_DP_AUX_PATH_OUT]->hops[0].in_hop_index,
-			paths[TB_DP_AUX_PATH_IN]->hops[last].next_hop_index);
+		ret = tb_dp_port_set_hops(tunnel->src_port,
+					  paths[TB_DP_VIDEO_PATH_OUT]->hops[0].in_hop_index,
+					  paths[TB_DP_AUX_PATH_OUT]->hops[0].in_hop_index,
+					  paths[TB_DP_AUX_PATH_IN]->hops[last].next_hop_index);
 
-		tb_dp_port_set_hops(tunnel->dst_port,
-			paths[TB_DP_VIDEO_PATH_OUT]->hops[last].next_hop_index,
-			paths[TB_DP_AUX_PATH_IN]->hops[0].in_hop_index,
-			paths[TB_DP_AUX_PATH_OUT]->hops[last].next_hop_index);
+		if (ret && tunnel->sleep_replay)
+			return ret;
+		ret = tb_dp_port_set_hops(tunnel->dst_port,
+					  paths[TB_DP_VIDEO_PATH_OUT]->hops[last].next_hop_index,
+					  paths[TB_DP_AUX_PATH_IN]->hops[0].in_hop_index,
+					  paths[TB_DP_AUX_PATH_OUT]->hops[last].next_hop_index);
 
+		if (ret && tunnel->sleep_replay)
+			return ret;
 		ops = tunnel->tb->nhi->ops;
-		if (ops && ops->dp_tunnel_pre_activate) {
+		if (!tunnel->sleep_replay && ops && ops->dp_tunnel_pre_activate) {
 			ret = ops->dp_tunnel_pre_activate(
 				tunnel->tb->nhi, tunnel->src_port,
 				tunnel->dst_port);
@@ -1630,8 +1640,8 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 			return ret;
 	}
 
-	if (active && tb_host_dp_policy(tunnel->tb->nhi,
-					TB_HOST_DP_HPD_ON_ACTIVATE)) {
+	if (active && !tunnel->sleep_replay &&
+	    tb_host_dp_policy(tunnel->tb->nhi, TB_HOST_DP_HPD_ON_ACTIVATE)) {
 		if (tb_port_is_dpin(tunnel->src_port))
 			tb_dp_apple_pulse_hpd(tunnel->src_port);
 		tb_dp_dump_apple(tunnel);
@@ -1640,7 +1650,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 	if (active) {
 		const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-		if (ops && ops->dp_tunnel_post_activate) {
+		if (!tunnel->sleep_replay && ops && ops->dp_tunnel_post_activate) {
 			u64 generation = tb_dp_tunnel_alloc_generation();
 
 			if (!generation)
@@ -1656,7 +1666,7 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		}
 	}
 
-	return active ? tb_dp_dprx_start(tunnel) : 0;
+	return active && !tunnel->sleep_replay ? tb_dp_dprx_start(tunnel) : 0;
 }
 
 /**
@@ -3012,6 +3022,87 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 err_free:
 	tb_tunnel_put(tunnel);
 	return NULL;
+}
+
+/* No host callbacks: the original display and PCIe owners stay bound. */
+int tb_tunnel_sleep_prepare(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (tunnel->sleep_paused || tb_tunnel_is_dma(tunnel) ||
+	    !tb_tunnel_is_active(tunnel))
+		return -EBUSY;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep_prepare(tunnel->paths[i]);
+		if (ret) {
+			while (i--)
+				tb_path_sleep_complete(tunnel->paths[i]);
+			return ret;
+		}
+	}
+	tunnel->sleep_paused = true;
+	if (tb_tunnel_is_dp(tunnel)) {
+		tunnel->sleep_dprx = tunnel->dprx_started && !tunnel->dprx_canceled;
+		tb_dp_dprx_stop(tunnel);
+	}
+	return 0;
+}
+
+int tb_tunnel_sleep(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	tunnel->sleep_changed = true;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep(tunnel->paths[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int tb_tunnel_wake(struct tb_tunnel *tunnel)
+{
+	int i, ret = 0;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	for (i = 0; i < tunnel->npaths; i++) {
+		if (tb_path_is_invalid(tunnel->paths[i]))
+			return -ENODEV;
+	}
+	if (!tunnel->sleep_changed)
+		return 0;
+	tunnel->sleep_replay = true;
+	if (tunnel->pre_activate)
+		ret = tunnel->pre_activate(tunnel);
+	for (i = 0; !ret && i < tunnel->npaths; i++)
+		ret = tb_path_wake(tunnel->paths[i]);
+	if (!ret && tunnel->activate)
+		ret = tunnel->activate(tunnel, true);
+	tunnel->sleep_replay = false;
+	if (!ret)
+		tunnel->sleep_changed = false;
+	return ret;
+}
+
+void tb_tunnel_sleep_complete(struct tb_tunnel *tunnel)
+{
+	int i;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (!tunnel->sleep_paused)
+		return;
+	for (i = 0; i < tunnel->npaths; i++)
+		tb_path_sleep_complete(tunnel->paths[i]);
+	tunnel->sleep_paused = false;
+	if (tunnel->sleep_dprx) {
+		tunnel->sleep_dprx = false;
+		tb_dp_dprx_start(tunnel);
+	}
 }
 
 /**
