@@ -4,15 +4,24 @@
 //!
 //! Copyright (C) The Asahi Linux Contributors
 
+use core::{
+    ffi::{c_int, c_void},
+    ptr,
+};
 use kernel::{
     bindings, c_str,
-    device::Core,
+    device::{self, Core},
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        atomic::{Atomic, Relaxed},
+        Arc,
+    },
+    types::Opaque,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -71,24 +80,19 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(
-    aop: &dyn AOP,
-    dev: &platform::Device,
-    svc: &EPICService,
-    offset: usize,
-) -> Result<()> {
+fn enable_als(aop: &dyn AOP, dev: &device::Device, svc: &EPICService, offset: usize) -> Result<()> {
     if offset != LUX_OFFSET_CT817 {
         // The installer collects the calibration blob from macOS, so it is
         // not present on every system. Without it the VD6286 of the M4 Pro
         // never reports and its channel reads ENODATA. The warning below
         // reports the missing file once, so the firmware loader is asked not
         // to report it too.
-        match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
+        match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev) {
             Ok(fw) => {
                 set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
             }
             Err(e) => dev_warn!(
-                dev.as_ref(),
+                dev,
                 "no apple/aop-als-cal.bin ({:?}); the sensor may not report\n",
                 e
             ),
@@ -105,13 +109,7 @@ fn enable_als(
     // wedges the AOP for the rest of the boot.
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
-            dev.as_ref(),
-            "{} = {:#x}: status {:#x}\n",
-            what,
-            val,
-            status
-        );
+        dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
@@ -205,9 +203,168 @@ enum AlsIio {
     },
 }
 
+/*
+ * A system sleep stops the AOP's endpoints, and the sensor comes back with its
+ * report interval at zero: reports only resume on the zero to non-zero
+ * transition that `enable_als()` makes at probe. So the interval goes to zero
+ * before a sleep, and the sensor is armed again after it, as the temperature
+ * service is.
+ */
+struct Control {
+    dev: ARef<device::Device>,
+    aop: Arc<dyn AOP>,
+    service: EPICService,
+    offset: usize,
+}
+
+impl Control {
+    fn new(
+        dev: &device::Device,
+        aop: Arc<dyn AOP>,
+        service: EPICService,
+        offset: usize,
+    ) -> Result<Arc<Self>> {
+        Ok(Arc::new(
+            Self {
+                dev: dev.into(),
+                aop,
+                service,
+                offset,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    fn start(&self) -> Result {
+        enable_als(self.aop.as_ref(), &self.dev, &self.service, self.offset)
+    }
+
+    fn stop(&self) -> Result {
+        // Only the transport can fail; the sensor's status word is logged, as
+        // for the writes in `enable_als()`.
+        let status = set_als_property(
+            self.aop.as_ref(),
+            &self.service,
+            ALS_PROP_INTERVAL,
+            &0u32.to_le_bytes(),
+        )?;
+        dev_dbg!(self.dev, "interval = 0: status {:#x}\n", status);
+        Ok(())
+    }
+}
+
+#[repr(C)]
+struct PmHook {
+    nb: Opaque<bindings::notifier_block>,
+    control: Arc<Control>,
+    registered: Atomic<bool>,
+}
+
+/// # Safety
+///
+/// `nb` is the first field of a registered `PmHook`.
+unsafe extern "C" fn pm_event(
+    nb: *mut bindings::notifier_block,
+    action: usize,
+    _data: *mut c_void,
+) -> c_int {
+    // SAFETY: `nb` is the first field of a registered, pinned `PmHook`.
+    let hook = unsafe { &*nb.cast::<PmHook>() };
+    let ret = match action as u32 {
+        bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => hook.control.stop(),
+        bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => hook.control.start(),
+        _ => return bindings::NOTIFY_DONE as c_int,
+    };
+    if let Err(e) = ret {
+        dev_warn!(
+            hook.control.dev,
+            "reports not switched for sleep: {:?}\n",
+            e
+        );
+    }
+    bindings::NOTIFY_OK as c_int
+}
+
+#[cfg(CONFIG_PM_SLEEP)]
+/// # Safety
+///
+/// `nb` remains pinned until [`pm_unregister`] is called.
+unsafe fn pm_register(nb: *mut bindings::notifier_block) -> c_int {
+    // SAFETY: The caller keeps the block pinned through unregister.
+    unsafe { bindings::register_pm_notifier(nb) }
+}
+
+#[cfg(CONFIG_PM_SLEEP)]
+/// # Safety
+///
+/// `nb` was registered by [`pm_register`].
+unsafe fn pm_unregister(nb: *mut bindings::notifier_block) {
+    // SAFETY: The block was registered by `pm_register`.
+    unsafe { bindings::unregister_pm_notifier(nb) };
+}
+
+#[cfg(not(CONFIG_PM_SLEEP))]
+/// # Safety
+///
+/// No requirements; this configuration has no PM notifier.
+unsafe fn pm_register(_nb: *mut bindings::notifier_block) -> c_int {
+    0
+}
+
+#[cfg(not(CONFIG_PM_SLEEP))]
+/// # Safety
+///
+/// No requirements; this configuration has no PM notifier.
+unsafe fn pm_unregister(_nb: *mut bindings::notifier_block) {}
+
+// SAFETY: The PM core serializes notifier operations.
+unsafe impl Send for PmHook {}
+// SAFETY: As above.
+unsafe impl Sync for PmHook {}
+
+impl PmHook {
+    fn new(control: Arc<Control>) -> Result<Pin<KBox<Self>>> {
+        let hook = KBox::pin(
+            Self {
+                nb: Opaque::new(bindings::notifier_block {
+                    notifier_call: Some(pm_event),
+                    next: ptr::null_mut(),
+                    priority: 0,
+                }),
+                control,
+                registered: Atomic::new(false),
+            },
+            GFP_KERNEL,
+        )?;
+        // SAFETY: The notifier remains pinned in `hook`.
+        let ret = unsafe { pm_register(hook.nb.get()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        hook.registered.store(true, Relaxed);
+        Ok(hook)
+    }
+
+    fn unregister(&self) {
+        if self.registered.xchg(false, Relaxed) {
+            // SAFETY: Registered by `new()` and still pinned.
+            unsafe { pm_unregister(self.nb.get()) };
+        }
+    }
+}
+
+impl Drop for PmHook {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
 struct IIOAopAlsDriver {
-    /// Declared first: the subscription ends before the IIO device goes.
+    /// Declared first: no sleep re-arms the sensor once the driver goes.
+    pm: Pin<KBox<PmHook>>,
+    /// Before the IIO device: the subscription ends before the IIO device goes.
     listener: FakehidRegistration,
+    control: Arc<Control>,
     _iio: AlsIio,
 }
 
@@ -220,7 +377,7 @@ fn register_channels<const N: usize>(
 ) -> Result<(FakehidRegistration, IIORegistration<MsgProc, N>)> {
     let data = AopSensorData::new_channels(pdev.as_ref().into(), types, MsgProc(offset))?;
     let listener = FakehidRegistration::new(aop.clone(), service, data.clone())?;
-    enable_als(aop.as_ref(), pdev, &service, offset)?;
+    enable_als(aop.as_ref(), pdev.as_ref(), &service, offset)?;
     let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
     let iio = IIORegistration::new_channels(
         data,
@@ -285,13 +442,20 @@ impl platform::Driver for IIOAopAlsDriver {
                 },
             )
         };
+        let control = Control::new(dev, adata, service, offset)?;
+        let pm = PmHook::new(control.clone())?;
         Ok(IIOAopAlsDriver {
+            pm,
             listener,
+            control,
             _iio: iio,
         })
     }
 
     fn unbind(_dev: &platform::Device<Core<'_>>, this: Pin<&Self>) {
+        this.pm.unregister();
+        // Leave the interval at zero, so a later probe arms the sensor again.
+        let _ = this.control.stop();
         this.listener.unregister();
     }
 }
