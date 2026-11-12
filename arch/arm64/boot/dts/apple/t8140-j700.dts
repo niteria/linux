@@ -434,37 +434,23 @@
 
 /*
  * A J700 has one of the two video encoders, and its ADT describes the one
- * the unit has: ave (VENC0) or ave1 (VENC1). Both stay disabled here, with
- * encoder 0's power states and performance report; the bootloader enables
- * the encoder the ADT describes, its DARTs and its power states. On a unit
- * with ave1, VENC0_SYS refuses its target, so nothing may enable it there.
+ * the unit has: ave (VENC0) or ave1 (VENC1). This unit has ave: its ADT has
+ * /arm-io/ave at 0x285100000 with VENC0 power gates, and every VENC1 power
+ * state carries the no-PS flag. Its loader (Aura 1.0.0b9) hands the encoder
+ * its firmware but enables no node, so enable encoder 0, its DARTs, its
+ * power states and its performance report here. Not for a unit with ave1:
+ * there VENC0_SYS refuses its target.
  */
-&pmp_report_ave0 {
-	status = "disabled";
+&ave_dart0 {
+	status = "okay";
 };
 
-&ps_venc0_sys {
-	status = "disabled";
+&ave_dart1 {
+	status = "okay";
 };
 
-&ps_venc0_dma {
-	status = "disabled";
-};
-
-&ps_venc0_pipe4 {
-	status = "disabled";
-};
-
-&ps_venc0_pipe5 {
-	status = "disabled";
-};
-
-&ps_venc0_me0 {
-	status = "disabled";
-};
-
-&ps_venc0_me1 {
-	status = "disabled";
+&ave {
+	status = "okay";
 };
 
 &serial0 {
