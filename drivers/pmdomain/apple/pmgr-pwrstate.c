@@ -1021,8 +1021,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			active = apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
 						   !ps->no_auto_enable && !ps->no_auto_pm) == 0;
 		}
-	} else if (active && !ps->firmware_owned && !ps->inherited_on) {
-		ps->genpd.flags |= GENPD_FLAG_DEFER_OFF | GENPD_FLAG_ACTIVE_WAKEUP;
+	} else if (!ps->firmware_owned && !ps->inherited_on) {
+		/*
+		 * A device on the wakeup path holds its domain through system sleep,
+		 * whether or not the domain was on when it was found: a coprocessor
+		 * powered up later (SIO) still needs it until its stop at the commit.
+		 */
+		ps->genpd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
+		if (active)
+			ps->genpd.flags |= GENPD_FLAG_DEFER_OFF;
 	}
 
 	/* Turn on auto-PM if the domain is already on, unless it must stay off */
