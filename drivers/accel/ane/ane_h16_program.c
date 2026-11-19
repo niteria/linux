@@ -619,6 +619,34 @@ static int h16_pool_room(struct ane_h16_session *s, const size_t *lengths,
 }
 
 /*
+ * Every CREATE makes the firmware ask for a 2 MiB EXPP process pool by
+ * SHAREDMALLOC and wait for it before it answers; a pool it could not get
+ * leaves the CREATE stalled and the engine quarantined, and with it every
+ * other program of the session. Take the pool before LOAD instead
+ * (ane_fw_transport_shared_reserve()), so that without memory or quota the
+ * LOAD fails cleanly, before any traffic. A FREE of a torn-down program's
+ * pool may still be posted (it can come after the post-UNLOAD settle):
+ * serve it and try once more before giving up.
+ */
+static int h16_process_pool(struct ane_h16_session *s)
+{
+	int ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M, ANE_FW_SHARED_EXPP);
+
+	if (ret == -ENOSPC) {
+		ret = ane_fw_transport_settle(s->transport, s->settle_ns,
+					      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
+		if (ret < 0)
+			return h16_fail(s, ret);
+		ret = ane_fw_transport_shared_reserve(s->transport, SZ_2M,
+						      ANE_FW_SHARED_EXPP);
+	}
+	if (ret)
+		s->ops->log(s->ctx, "LOAD: no process pool", (u64)-ret,
+			    s->transport->shared_bytes);
+	return ret;
+}
+
+/*
  * The last program of this firmware boot was torn down cleanly and nothing
  * is in flight: the firmware is done with every command published since the
  * LOAD that found no program alive (LOAD, CREATE, gates, TERMINATE and
@@ -1027,6 +1055,9 @@ int ane_h16_session_load(struct ane_h16_session *s,
 	if (ret)
 		return ret;
 	ret = h16_pool_room(s, h16_load_sequence, ARRAY_SIZE(h16_load_sequence));
+	if (ret)
+		return ret;
+	ret = h16_process_pool(s);
 	if (ret)
 		return ret;
 	p = kzalloc_obj(*p);
@@ -1988,6 +2019,8 @@ static int h16_replay(struct ane_h16_session *s, struct ane_h16_program *p)
 	int ret;
 
 	ret = h16_pool_room(s, h16_load_sequence, 2);
+	if (!ret)
+		ret = h16_process_pool(s);
 	if (ret)
 		return ret;
 	command = kzalloc(ANE_H16_CREATE_SIZE, GFP_KERNEL);
