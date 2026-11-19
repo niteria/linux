@@ -1899,6 +1899,28 @@ static int add_dcp_components(struct device *dev,
 		}
 	}
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO) && IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
+	/*
+	 * T8132 external DCPs are adopted outside the DRM component list
+	 * (t8132_ext_drm.c), so their dpaudio nodes are matched here.
+	 */
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
+		if (!of_device_is_available(np))
+			continue;
+		for_each_endpoint_of_node(np, endpoint) {
+			port = of_graph_get_remote_port_parent(endpoint);
+			if (!port)
+				continue;
+			if (of_device_is_compatible(port, "apple,dpaudio") &&
+			    of_device_is_available(port))
+				drm_of_component_match_add(dev, matchptr,
+							   component_compare_of,
+							   port);
+			of_node_put(port);
+		}
+	}
+#endif
+
 	return num;
 }
 

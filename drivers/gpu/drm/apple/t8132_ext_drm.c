@@ -49,6 +49,7 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "av.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
 
@@ -211,15 +212,19 @@ static void t8132_ext_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commi
 
 	out->first_frame = false;
 	out->frame_lost = true;
+	if (owner)
+		av_audio_before_modeset(owner);
 	ret = owner ? iomfb_m4_ext_enable(owner, &to_t8132_ext_crtc_state(crtc->state)->ids,
 					  mode->hdisplay, mode->vdisplay) : -ENODEV;
-	if (ret)
+	if (ret) {
 		dev_warn(&out->pdev->dev, "%s on: %ux%u@%d Hz failed: %d\n",
 			 crtc->name, mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode), ret);
-	else
+	} else {
 		dev_info(&out->pdev->dev, "%s on: %ux%u@%d Hz, %d kHz\n",
 			 crtc->name, mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
 			 mode->clock);
+		av_service_connect(owner);
+	}
 }
 
 static void t8132_ext_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
@@ -231,8 +236,10 @@ static void t8132_ext_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_comm
 
 	cancel_delayed_work_sync(&out->flip_work);
 	t8132_ext_send_event(out);
-	if (owner)
+	if (owner) {
+		av_service_disconnect(owner);
 		ret = iomfb_m4_ext_blank(owner);
+	}
 	dev_info(&out->pdev->dev, "%s off: %d\n", crtc->name, ret);
 }
 
@@ -780,6 +787,29 @@ void t8132_ext_drm_flip_done(struct device *dcpext)
 		if (t8132_ext_live[i] && &t8132_ext_live[i]->pdev->dev == dcpext)
 			t8132_ext_send_event(t8132_ext_live[i]);
 	spin_unlock_irqrestore(&t8132_ext_lock, flags);
+}
+
+int t8132_ext_drm_copy_eld(struct device *dcpext, u8 *eld, size_t size)
+{
+	struct drm_connector *connector = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&t8132_ext_lock, flags);
+	for (unsigned int i = 0; i < T8132_EXT_MAX; i++) {
+		if (t8132_ext_live[i] && &t8132_ext_live[i]->pdev->dev == dcpext) {
+			connector = &t8132_ext_live[i]->connector;
+			drm_connector_get(connector);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&t8132_ext_lock, flags);
+	if (!connector)
+		return -ENODEV;
+	mutex_lock(&connector->eld_mutex);
+	memcpy(eld, connector->eld, min(size, sizeof(connector->eld)));
+	mutex_unlock(&connector->eld_mutex);
+	drm_connector_put(connector);
+	return 0;
 }
 
 void t8132_ext_drm_hotplug(struct device *dcpext)

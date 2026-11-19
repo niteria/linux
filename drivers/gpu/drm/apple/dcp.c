@@ -8905,6 +8905,8 @@ static void dcp_t8132_sleep_release(struct apple_dcp *dcp)
 	if (dptx_service_available(&dcp->dptxport[0]) &&
 	    READ_ONCE(dcp->dptxport[0].connected))
 		iomfb_m4_ext_relink_expect(dcp);
+	if (READ_ONCE(dcp->avep))
+		av_service_disconnect(dcp);
 	dcp_t8132_hpd_low(dcp, 0);
 	/* Released whatever the firmware answers (dcp_dptx_release_locked()). */
 	dcp_dptx_disconnect(dcp, 0);
@@ -8938,9 +8940,14 @@ static void dcp_t8132_sleep_reconnect(struct apple_dcp *dcp)
  */
 static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
 {
+	struct apple_dcp_afkep *avep;
+
 	if (!dcp_is_t8132_ext(dcp) || !dcp->dptxep || !iomfb_m4_ext_stopped(dcp))
 		return;
 	afk_compact_orphans_drop(dcp->dptxep);
+	avep = READ_ONCE(dcp->avep);
+	if (avep)
+		afk_compact_orphans_drop(avep);
 	WRITE_ONCE(dcp->t8132_release_late, false);
 }
 

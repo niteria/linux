@@ -3,6 +3,7 @@
 #ifndef __APPLE_T8132_EXT_DRM_H__
 #define __APPLE_T8132_EXT_DRM_H__
 
+#include <linux/errno.h>
 #include <linux/kconfig.h>
 #include <linux/types.h>
 
@@ -28,6 +29,7 @@ void t8132_ext_drm_flip_done(struct device *dcpext);
 /* Whether @state has one of these CRTCs, and wait for their flips. */
 bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state);
 void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state);
+int t8132_ext_drm_copy_eld(struct device *dcpext, u8 *eld, size_t size);
 #else
 static inline int t8132_ext_drm_init(struct drm_device *drm) { return 0; }
 static inline void t8132_ext_drm_fini(struct drm_device *drm) { }
@@ -38,6 +40,10 @@ static inline void t8132_ext_drm_hotplug(struct device *dcpext) { }
 static inline void t8132_ext_drm_flip_done(struct device *dcpext) { }
 static inline bool t8132_ext_drm_in_commit(struct drm_atomic_commit *state) { return false; }
 static inline void t8132_ext_drm_wait_flips(struct drm_atomic_commit *state) { }
+static inline int t8132_ext_drm_copy_eld(struct device *dcpext, u8 *eld, size_t size)
+{
+	return -ENODEV;
+}
 #endif
 
 #endif

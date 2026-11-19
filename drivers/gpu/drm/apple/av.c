@@ -21,6 +21,14 @@
 #include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "iomfb_m4.h"
+#include "t8132_ext_drm.h"
+
+/* A T8132 DCPEXT, whose endpoints iomfb_m4 starts. */
+static inline bool av_t8132_external(const struct apple_dcp *dcp)
+{
+	return iomfb_is_m4(dcp) && iomfb_m4_is_external(dcp);
+}
 
 struct dcp_av_audio_cmds {
 	/* commands in group 0*/
@@ -196,6 +204,11 @@ static void av_audiosrv_init(struct apple_epic_service *service, const char *nam
 	if (old)
 		afk_service_put(old);
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* A T8132 DCPEXT's endpoint is the one the service came on. */
+	if (av_t8132_external(dcp))
+		WRITE_ONCE(dcp->avep, service->ep);
+#endif
 	asrv->plugged = true;
 	/* A new instance, maybe a new sink: its catalog is asked for afresh. */
 	WRITE_ONCE(asrv->elements_empty, false);
@@ -298,14 +311,15 @@ int dcp_audiosrv_unprepare(struct device *dev)
  * The external processors whose audio service is the desktop 26.x one:
  * dcpav-audio-interface-epic on endpoint 0x2b, compact EPIC. The T6041
  * DCPEXTs, and the J700 (T8140, H17P firmware) DCPEXT, whose service macOS
- * 26.6 drives with the same methods and link data; and firmware 27's
- * (T6050) DCPEXTs, whose link data differs (see dcp_audiosrv_link()).
+ * 26.6 drives with the same methods and link data; firmware 27's
+ * (T6050) DCPEXTs, whose link data differs (see dcp_audiosrv_link()); and
+ * the T8132 DCPEXTs, whose endpoints iomfb_m4 starts (av_t8132_ext_ops()).
  */
 static bool av_desktop_audio_role(struct apple_dcp *dcp)
 {
 	return (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop_external) ||
 	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	       dcp_is_v27_external(dcp);
+	       dcp_is_v27_external(dcp) || av_t8132_external(dcp);
 }
 
 bool dcp_audiosrv_link_by_format(struct device *dev)
@@ -318,6 +332,8 @@ bool dcp_audiosrv_native_link(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (!dcp)
+		return of_device_is_compatible(dev->of_node, "apple,t8132-dcpext");
 	return dcp_is_v14_7_external(dcp) || av_desktop_audio_role(dcp);
 }
 
@@ -783,8 +799,11 @@ int dcp_audio_sink_eld(struct device *dev, u8 *eld, size_t size)
 	if (!dcp)
 		return -ENODEV;
 	connector = READ_ONCE(dcp->connector);
-	if (!connector)
+	if (!connector) {
+		if (av_t8132_external(dcp))
+			return t8132_ext_drm_copy_eld(dev, eld, size);
 		return -ENODEV;
+	}
 	guard(mutex)(&connector->base.eld_mutex);
 	memcpy(eld, connector->base.eld, min(size, sizeof(connector->base.eld)));
 	return 0;
@@ -967,14 +986,16 @@ static const struct apple_epic_service_ops av_desktop_ops[];
  * interface on endpoint 0x2b as dcpav-audio-interface-epic, unit 0. With
  * the role in front ("dispext0:") the announcement is longer than its
  * field, so it arrives cut, without the unit: admit the cut too, as unit 0.
+ * On a T8132 DCPEXT these services are offered on each endpoint iomfb_m4
+ * starts, and taken on whichever announces them.
  */
 static int av_desktop_audio_prepare(struct apple_epic_service *service, const char *name,
 				    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 
-	if (!av_desktop_audio_role(dcp) ||
-	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP || !name)
+	if (!av_desktop_audio_role(dcp) || !name ||
+	    (service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP && !av_t8132_external(dcp)))
 		return -EINVAL;
 	if (!strcmp(name, av_desktop_ops[0].name) && unit == 0)
 		return 0;
@@ -1023,6 +1044,15 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 	},
 	{}
 };
+
+/*
+ * A T8132 DCPEXT's audio interface service, for the endpoints iomfb_m4
+ * starts: NULL unless avep_init() has set up its audio.
+ */
+const struct apple_epic_service_ops *av_t8132_ext_ops(struct apple_dcp *dcp)
+{
+	return av_t8132_external(dcp) && dcp->audiosrv ? &av_desktop_ops[0] : NULL;
+}
 #endif
 
 static const struct apple_epic_service_ops avep_ops[] = {
@@ -1055,6 +1085,9 @@ void av_service_connect(struct apple_dcp *dcp)
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
+
+	if (!asrv)
+		return;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 		service = afk_service_pin(asrv->srv);
@@ -1141,6 +1174,9 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 	struct apple_epic_service *service;
 	struct audiosrv_data *asrv = dcp->audiosrv;
 	int ret;
+
+	if (!asrv)
+		return;
 
 	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -1339,7 +1375,8 @@ static void av_audiosrv_cleanup(void *data)
 		WRITE_ONCE(dcp->desktop->graph[cleanup->ep->endpoint - 0x20], NULL);
 	/* An old devres group must not unpublish a later session. */
 	if (dcp->audiosrv == asrv) {
-		if (dcp->avep == cleanup->ep)
+		/* A T8132 DCPEXT's endpoint is not this cleanup's (NULL), see av_audiosrv_init(). */
+		if (dcp->avep == cleanup->ep || iomfb_is_m4(dcp))
 			dcp->avep = NULL;
 		dcp->audiosrv = NULL;
 	}
@@ -1400,7 +1437,7 @@ int avep_init(struct apple_dcp *dcp)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	    dcp_is_v27_external(dcp)) {
+	    dcp_is_v27_external(dcp) || iomfb_is_m4(dcp)) {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 		if (!av_desktop_audio_role(dcp))
 			return -EOPNOTSUPP;
@@ -1455,6 +1492,10 @@ int avep_init(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_27_0:
 		audiosrv_data->cmds = dcp_av_audio_cmds_v27;
 		break;
+	case DCP_FIRMWARE_M4:
+		/* The T8132 DCPEXT, firmware 26.6.2, as the desktop 26.x ones. */
+		audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
+		break;
 #endif
 	default:
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -1493,6 +1534,12 @@ unsupported:
 
 	device_link_add(&audio_pdev->dev, dev,
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* A T8132 DCPEXT's endpoints are iomfb_m4's, see av_t8132_ext_ops(). */
+	if (av_t8132_external(dcp))
+		return av_audiosrv_register_cleanup(dcp, audiosrv_data, NULL);
+#endif
 
 	/* The J700 and T6050 DCPEXTs: start the audio endpoint only if the firmware has it. */
 	if ((dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||

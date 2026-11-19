@@ -48,6 +48,7 @@
 #include <linux/soc/apple/pmgr-pwrstate.h>
 
 #include "afk.h"
+#include "av.h"
 #include "dcp.h"
 #include "dcp-sdr-edid.h"
 #include "dptxep.h"
@@ -186,6 +187,8 @@ struct iomfb_m4 {
 	bool external; /* an adopted external DCP: no panel */
 	/* AFK endpoints started on an adopted external DCP, by endpoint - 0x20. */
 	struct apple_dcp_afkep *probe_ep[0x20];
+	/* Their services: dcp_m4_probe_ops, with DP/HDMI audio if it is set up. */
+	struct apple_epic_service_ops probe_ops[4];
 	/*
 	 * The sink's dcpav-service-epic on EP 0x28, the one last announced,
 	 * and how many were: the firmware announces a new one for each sink
@@ -2857,6 +2860,32 @@ static void *dcp_m4_afk_alloc(struct apple_dcp *owner, size_t size, dma_addr_t *
 	return buf;
 }
 
+/*
+ * The services of an external DCP's endpoints: the sink's AV service, the
+ * DP/HDMI audio interface (av.c) when the display's audio is set up, and
+ * every other one noted.
+ */
+static void dcp_m4_build_probe_ops(struct iomfb_m4 *dcp)
+{
+	const struct apple_epic_service_ops *audio;
+	unsigned int n = 0;
+	int ret;
+
+	/* Set up once per device; a later adoption reuses it. */
+	if (IS_ENABLED(CONFIG_DRM_APPLE_AUDIO) && hdmi_audio && !dcp->owner->audiosrv) {
+		ret = avep_init(dcp->owner);
+		if (ret)
+			dev_warn(dcp->dev, "DP/HDMI audio not set up: %d\n", ret);
+	}
+	audio = av_t8132_ext_ops(dcp->owner);
+	/* The entries' names are const: copied, not assigned. */
+	memcpy(&dcp->probe_ops[n++], &dcp_m4_probe_ops[0], sizeof(*dcp->probe_ops));
+	if (audio)
+		memcpy(&dcp->probe_ops[n++], audio, sizeof(*dcp->probe_ops));
+	memcpy(&dcp->probe_ops[n++], &dcp_m4_probe_ops[1], sizeof(*dcp->probe_ops));
+	memset(&dcp->probe_ops[n], 0, sizeof(*dcp->probe_ops));
+}
+
 /* Start an external DCP's endpoints, those it advertises, in a fixed order. */
 static void dcp_m4_probe_endpoints(struct iomfb_m4 *dcp)
 {
@@ -2865,12 +2894,13 @@ static void dcp_m4_probe_endpoints(struct iomfb_m4 *dcp)
 	int ret;
 
 	dcp->owner->afk_alloc = dcp_m4_afk_alloc;
+	dcp_m4_build_probe_ops(dcp);
 	for (i = 0; i < ARRAY_SIZE(eps); i++) {
 		struct apple_dcp_afkep *ep;
 
 		if (!apple_rtkit_has_endpoint(dcp->rtkit, eps[i]))
 			continue;
-		ep = afk_init(dcp->owner, eps[i], dcp_m4_probe_ops);
+		ep = afk_init(dcp->owner, eps[i], dcp->probe_ops);
 		if (IS_ERR(ep)) {
 			dev_warn(dcp->dev, "endpoint %02x init failed: %ld\n", eps[i],
 				 PTR_ERR(ep));
@@ -3447,6 +3477,13 @@ const struct drm_edid *iomfb_m4_ext_edid(struct apple_dcp *owner)
 	mutex_unlock(&dcp->ext_modes_lock);
 	drm_edid_free(old);
 	return edid;
+}
+
+bool iomfb_m4_is_external(const struct apple_dcp *owner)
+{
+	const struct iomfb_m4 *dcp = owner->v26_6;
+
+	return dcp && dcp->external;
 }
 
 /*
