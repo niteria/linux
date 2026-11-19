@@ -55,10 +55,9 @@ enum ane_fw_stage {
 struct ane_fw_mapping {
 	struct list_head list;
 	struct ane_fw_surface surface;
-	dma_addr_t physical;
 	/*
-	 * A cached surface: discontiguous pages (ane_fw_pages_alloc()), mapped
-	 * through b->memory for cache maintenance and at consecutive DVAs.
+	 * Discontiguous pages (ane_fw_pages_alloc()), mapped through b->memory
+	 * for cache maintenance and at consecutive DVAs.
 	 */
 	struct page **pages;
 	struct sg_table sgt;
@@ -1588,7 +1587,7 @@ static int ane_fw_map(struct ane_fw_backend *b, u64 dva, phys_addr_t pa,
 	return ret ?: ane_fw_map_status(b);
 }
 
-/* Pages, CPU alias and cache maintenance of a cached surface the engine never saw. */
+/* Pages, CPU alias and cache maintenance of a surface the engine never saw. */
 static void ane_fw_pages_release(struct ane_fw_backend *b, struct ane_fw_mapping *m)
 {
 	if (m->sgt.sgl) {
@@ -1603,14 +1602,21 @@ static void ane_fw_pages_release(struct ane_fw_backend *b, struct ane_fw_mapping
 }
 
 /*
- * A cached surface from discontiguous pages: blocks of the DART granule or
- * larger, with a contiguous CPU alias (vmap) and DVA range. The firmware
- * runs from whatever the DARTs map, so nothing needs a contiguous physical
- * range the size of the program, which only CMA could give (a 66 MB H17
- * program needed cma=256M). b->memory is dma-direct; its mapping only does
- * the cache maintenance, so its addresses must be the physical ones.
+ * A surface from discontiguous pages: blocks of the DART granule or larger,
+ * with a contiguous CPU alias (vmap) and DVA range. The firmware runs from
+ * whatever the DARTs map, so nothing needs a contiguous physical range the
+ * size of the surface, which only CMA could give (a 66 MB H17 program
+ * needed cma=256M). b->memory is dma-direct; its mapping only does the cache
+ * maintenance, so its addresses must be the physical ones.
+ *
+ * An uncached surface gets a write-combining alias, Normal Non-cacheable on
+ * arm64 like the remap of a dma-direct coherent buffer: its zeroes are
+ * written back and the cacheable lines of the linear map invalidated before
+ * anyone uses it, as for that buffer, and nothing touches it through the
+ * linear map afterwards.
  */
-static int ane_fw_alloc_pages(struct ane_fw_backend *b, size_t size, struct ane_fw_mapping *m)
+static int ane_fw_alloc_pages(struct ane_fw_backend *b, size_t size, bool cached,
+			      struct ane_fw_mapping *m)
 {
 	struct scatterlist *sg;
 	unsigned int i;
@@ -1624,7 +1630,8 @@ static int ane_fw_alloc_pages(struct ane_fw_backend *b, size_t size, struct ane_
 		return ret;
 	}
 	m->surface.size = size;
-	m->surface.cpu = vmap(m->pages, size >> PAGE_SHIFT, VM_MAP, PAGE_KERNEL);
+	m->surface.cpu = vmap(m->pages, size >> PAGE_SHIFT, VM_MAP,
+			      cached ? PAGE_KERNEL : pgprot_writecombine(PAGE_KERNEL));
 	if (!m->surface.cpu)
 		return -ENOMEM;
 	ret = sg_alloc_table_from_pages(&m->sgt, m->pages, size >> PAGE_SHIFT, 0, size,
@@ -1640,19 +1647,26 @@ static int ane_fw_alloc_pages(struct ane_fw_backend *b, size_t size, struct ane_
 	for_each_sgtable_dma_sg(&m->sgt, sg, i)
 		if (sg_dma_address(sg) != sg_phys(sg) || sg_dma_len(sg) != sg->length)
 			return -EIO;
+	if (!cached)
+		dma_sync_sgtable_for_cpu(b->memory, &m->sgt, DMA_BIDIRECTIONAL);
 	return 0;
 }
 
 /*
- * Coherent (uncached) memory for firmware-owned state, or, with cached,
- * CPU-cacheable memory for program surfaces that the CPU copies to and from
- * on every request. The engine does not snoop either; cached surfaces are
- * kept coherent by ane_fw_program_sync() around each use.
+ * Uncached memory for firmware-owned state, or, with cached, CPU-cacheable
+ * memory for program surfaces that the CPU copies to and from on every
+ * request. The engine does not snoop either; cached surfaces are kept
+ * coherent by ane_fw_program_sync() around each use. Neither comes from a
+ * contiguous allocation (ane_fw_alloc_pages()). Firmware memory used to be
+ * dma_alloc_coherent(), which takes CMA first: the preload copies, heap,
+ * pool and IPC (about 19 MiB, kept from probe on) and a 2 MiB process pool
+ * for every program loaded at once, out of a default CMA area of 32 MiB.
  */
 static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 			    int prot, bool cached, struct ane_fw_surface *s)
 {
 	struct ane_fw_mapping *m;
+	ssize_t mapped;
 	int ret;
 
 	/* No memory for a range the window cannot hold. */
@@ -1662,24 +1676,16 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 	m = kzalloc_obj(*m);
 	if (!m)
 		return -ENOMEM;
-	if (cached) {
-		ret = ane_fw_alloc_pages(b, size, m);
-		if (ret) {
-			/* Never mapped for the engine: free it all now. */
-			ane_fw_pages_release(b, m);
-			kfree(m);
-			return ret;
-		}
-		/* The mapping: ane_fw_program_sync() maintains the whole of it. */
-		m->surface.handle = (uintptr_t)m;
-	} else {
-		m->surface.cpu = dma_alloc_coherent(b->memory, size, &m->physical,
-						    GFP_KERNEL);
-		if (!m->surface.cpu) {
-			kfree(m);
-			return -ENOMEM;
-		}
+	ret = ane_fw_alloc_pages(b, size, cached, m);
+	if (ret) {
+		/* Never mapped for the engine: free it all now. */
+		ane_fw_pages_release(b, m);
+		kfree(m);
+		return ret;
 	}
+	/* The mapping: ane_fw_program_sync() maintains the whole of it. */
+	if (cached)
+		m->surface.handle = (uintptr_t)m;
 	mutex_lock(&b->window_lock);
 	if (dva == ANE_FW_WINDOW_ANY) {
 		ret = drm_mm_insert_node_in_range(&b->dva_window, &m->node, size, SZ_16K, 0,
@@ -1688,10 +1694,7 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 						  DRM_MM_INSERT_LOW);
 		if (ret) {
 			mutex_unlock(&b->window_lock);
-			if (cached)
-				ane_fw_pages_release(b, m);
-			else
-				dma_free_coherent(b->memory, size, m->surface.cpu, m->physical);
+			ane_fw_pages_release(b, m);
 			kfree(m);
 			return ret;
 		}
@@ -1705,13 +1708,8 @@ static int ane_fw_alloc_mem(struct ane_fw_backend *b, u64 dva, size_t size,
 	 */
 	list_add_tail(&m->list, &b->mappings);
 	mutex_unlock(&b->window_lock);
-	if (cached) {
-		ssize_t mapped = iommu_map_sgtable(b->domain, dva, &m->sgt, prot);
-
-		ret = mapped < 0 ? mapped : (size_t)mapped != size ? -EIO : ane_fw_map_status(b);
-	} else {
-		ret = ane_fw_map(b, dva, m->physical, size, prot);
-	}
+	mapped = iommu_map_sgtable(b->domain, dva, &m->sgt, prot);
+	ret = mapped < 0 ? mapped : (size_t)mapped != size ? -EIO : ane_fw_map_status(b);
 	if (!ret)
 		*s = m->surface;
 	return ret;
@@ -2003,7 +2001,7 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 	ret = ane_fw_heap_tail(dva, size, ANE_FW_POOL_DVA, &tail, &tail_size);
 	if (ret || !tail_size)
 		return ret;
-	/* Zeroed by the coherent allocation; kept until reset like the preload. */
+	/* Zeroed by the allocation; kept until reset like the preload. */
 	ret = ane_fw_alloc_at(b, tail, tail_size, IOMMU_READ | IOMMU_WRITE, &heap_tail);
 	if (!ret)
 		b->heap_tail = heap_tail;
