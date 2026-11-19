@@ -30,6 +30,7 @@
 #include "ane_fw_pages.h"
 #include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
+#include "ane_t6021_lifetime.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
 #define ANE_FW_IPC_DVA 0x100003d0000ULL
@@ -147,6 +148,18 @@ struct ane_fw_backend {
 	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
+	/*
+	 * Recovery of a session quarantined by a hung request (ane_fw_hung()):
+	 * at runtime by the recover work, else by the next system sleep.
+	 * hung_down: the quarantined engine was powered off under its firmware;
+	 * from then on genpd's next ANE_SYS OFF, with the PMGR actual state off,
+	 * sets hung_off (ane_fw_genpd_event()), the proof the firmware is gone.
+	 */
+	struct work_struct recover;
+	bool hung_down, hung_off;
+	/* A power-down outside a sleep: a stuck power word cannot wait for one. */
+	bool runtime_off;
+	u64 recoveries, recover_failures;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -582,7 +595,7 @@ static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
 			return 0;
 	}
-	if (!apple_sleep_request_deep_once())
+	if (b->runtime_off || !apple_sleep_request_deep_once())
 		return ret;
 	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
 	return 0;
@@ -608,7 +621,7 @@ static int ane_fw_power_down_staged(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
-	b->powered = false;
+	WRITE_ONCE(b->powered, false);
 	b->power_ref = false;
 	pm_runtime_put_sync(b->power);
 	/*
@@ -649,7 +662,7 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
-	b->powered = false;
+	WRITE_ONCE(b->powered, false);
 	/*
 	 * Our reference was the last one on ANE_SYS: genpd turns it off once the
 	 * ANE DARTs are idle, or at the latest in the noirq phase of the system
@@ -772,8 +785,10 @@ static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
  * and startup as start-at-boot does. The shared allocations are carried
  * into the new transport and served again; programs loaded before are lost.
  * Every wait is bounded (power polls, READY, ANE_FW_TIMEOUT_NS commands).
+ * With @recover the old firmware was a quarantined one, proven gone
+ * (ane_fw_hung_gone()): its quarantine ends before the replay.
  */
-static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
+static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b, bool recover)
 {
 	struct device *dev = &b->pdev->dev;
 	struct ane_fw_transport *old;
@@ -839,6 +854,9 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 		div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));
 	/* Every open program back behind its handle, as the application left it. */
 	ane_h16_session_restart(&b->session);
+	/* Programs closed while quarantined go back to the spares. */
+	if (recover)
+		ane_h16_session_recovered(&b->session);
 	ret = ane_h16_session_replay(&b->session, &b->resume_replayed, &b->resume_first_ns);
 	if (ret) {
 		dev_err(dev, "H17 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
@@ -1082,7 +1100,7 @@ static void ane_fw_unpark(struct ane_fw_backend *b)
 	if (!b->parked)
 		return;
 	b->in_rpm = true;
-	ret = ane_fw_cold_cycle_boot(b);
+	ret = ane_fw_cold_cycle_boot(b, false);
 	b->in_rpm = false;
 	WRITE_ONCE(b->parked, false);
 	WRITE_ONCE(b->session.parked, false);
@@ -1093,6 +1111,175 @@ static void ane_fw_unpark(struct ane_fw_backend *b)
 	}
 	ane_h16_session_sleep(&b->session, false);
 	dev_info(&b->pdev->dev, "H17 ANE: up for a request%s\n", ret ? " FAILED" : "");
+}
+
+/*
+ * Recovery of a session quarantined by a hung request, as the H16 and T8112
+ * paths do it and as macOS restarts the firmware after a request timeout:
+ * the engine is powered off under the firmware, proven off, booted again
+ * from the preload, and every open program is replayed behind its handle.
+ *
+ * The firmware is not asked for anything: a STOP to a hung firmware times
+ * out and changes nothing, and macOS goes on with the power-off when its
+ * stop is not answered. No new register is written either: the power-down
+ * is the one a sleep and a park use (sub-block, PWGATE and its ack, CPU,
+ * then ANE_SYS through genpd, which deactivates the DARTs right before it).
+ *
+ * Nothing the old firmware could reach is reused before ane_fw_hung_proven():
+ * genpd reported ANE_SYS off after our power-down, with its PMGR actual
+ * state off, and the CPU and sub-block power states read off. Only then does
+ * the cold boot clear pool, IPC, heap and heap tail, copy TEXT and DATA from
+ * the preload again (digests checked) and give back the memory of programs
+ * closed while quarantined. The power-up before it repeats the cold PMGR,
+ * PWGATE and DART checks of every boot.
+ */
+#define ANE_FW_HUNG_OFF_MS 2000
+
+/*
+ * Power a quarantined engine off under its firmware. From here on, genpd's
+ * next ANE_SYS OFF proves it off: we hold ANE_SYS until the power-down puts
+ * it, so no OFF can come earlier.
+ */
+static int ane_fw_hung_down(struct ane_fw_backend *b, bool runtime)
+{
+	int ret;
+
+	if (!b->hung_down) {
+		WRITE_ONCE(b->hung_off, false);
+		/* Seen by ane_fw_genpd_event() before the put below can turn ANE_SYS off. */
+		smp_store_release(&b->hung_down, true);
+	}
+	if (!b->powered) {
+		/* Off already: an earlier attempt, whose proof may still come. */
+		if (b->power_ref) {
+			b->power_ref = false;
+			pm_runtime_put_sync_suspend(b->power);
+		}
+		return 0;
+	}
+	/* At runtime there is no deep path: a stuck power word fails it. */
+	b->runtime_off = runtime;
+	ret = ane_fw_power_down(b);
+	b->runtime_off = false;
+	return ret;
+}
+
+static bool ane_fw_hung_proven(struct ane_fw_backend *b)
+{
+	struct ane_fw_hung_proof p = {
+		.down = b->hung_down,
+		.sys_off = READ_ONCE(b->hung_off),
+		.held = b->powered || b->power_ref,
+	};
+
+	/* PMGR only: readable whatever ANE_SYS does. */
+	ane_fw_snapshot_pmgr(b);
+	return ane_fw_hung_gone(&p, &b->cold);
+}
+
+/* At runtime genpd turns ANE_SYS off once the ANE DARTs are idle too. */
+static bool ane_fw_hung_wait_off(struct ane_fw_backend *b)
+{
+	u64 deadline = ktime_get_ns() + ANE_FW_HUNG_OFF_MS * NSEC_PER_MSEC;
+
+	while (!READ_ONCE(b->hung_off) && ktime_get_ns() < deadline)
+		usleep_range(10000, 20000);
+	return READ_ONCE(b->hung_off);
+}
+
+/* The new firmware is up: the next hang starts its proof afresh. */
+static void ane_fw_hung_recovered(struct ane_fw_backend *b)
+{
+	b->hung_down = false;
+	WRITE_ONCE(b->hung_off, false);
+	b->recoveries++;
+}
+
+static void ane_fw_recover_work(struct work_struct *work)
+{
+	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, recover);
+	struct device *dev = &b->pdev->dev;
+	unsigned int settle = min(READ_ONCE(ane_t6021_hung_settle_ms), 60000U);
+	bool rpm = ane_fw_rpm(b), held = false;
+	u64 start = ktime_get_ns();
+	int ret;
+
+	/*
+	 * Keep runtime PM from starting a park, and wait for any park in
+	 * flight before taking b->lock so dropping ANE_SYS under b->lock
+	 * cannot wait on a callback that needs b->lock.
+	 */
+	if (rpm) {
+		pm_runtime_get_noresume(dev);
+		pm_runtime_barrier(dev);
+		held = true;
+	}
+	scoped_guard(mutex, &b->lock) {
+		/* A system sleep recovers it itself (ane_fw_sleep_prepare()). */
+		if (!READ_ONCE(ane_t6021_hung_stop) || READ_ONCE(b->in_sleep) || b->slept ||
+		    b->parked || b->stage != ANE_STAGE_PROGRAM || !b->session.quarantined)
+			break;
+		/* Closes admission: requests wait in ane_h16_session_enter() meanwhile. */
+		ane_h16_session_sleep(&b->session, true);
+		/* Time for the engine to drain what it has in flight, as on H16. */
+		msleep(settle);
+		/* Hand our reference to b->power_ref so ane_fw_hung_down() drops ANE_SYS. */
+		if (held) {
+			if (b->power_ref)
+				pm_runtime_put_noidle(dev);
+			else
+				b->power_ref = true;
+			held = false;
+		}
+		ret = ane_fw_hung_down(b, true);
+		if (!ret && !ane_fw_hung_wait_off(b))
+			ret = -ETIMEDOUT;
+		if (!ret && !ane_fw_hung_proven(b))
+			ret = -EIO;
+		if (ret) {
+			b->recover_failures++;
+			dev_err(dev,
+				"H17 ANE: hung engine not proven off (%d; ANE_SYS %#x CPU %#x sub-block %#x); quarantined until the next system sleep\n",
+				ret, ane_rd32(b, b->pmgr + b->soc->pmgr_sys),
+				ane_rd32(b, b->pmgr + b->soc->pmgr_cpu),
+				ane_rd32(b, b->pmgr + b->soc->pmgr_subblock));
+			ane_h16_session_sleep(&b->session, false);
+			break;
+		}
+		b->resume_replayed = 0;
+		b->resume_first_ns = 0;
+		ret = ane_fw_cold_cycle_boot(b, true);
+		if (ret) {
+			b->recover_failures++;
+			/* Booted over memory proven free: as any failed boot, until reboot. */
+			ane_fw_quarantine(b, ret);
+			b->session.quarantined = true;
+		} else {
+			ane_fw_hung_recovered(b);
+			ane_fw_rpm_idle(b);
+		}
+		ane_h16_session_sleep(&b->session, false);
+		dev_info(dev,
+			 "H17 ANE: %s after a hung request in %llu ms (settle %u ms), %u programs replayed\n",
+			 ret ? "recovery FAILED" : "firmware recovered",
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), settle, b->resume_replayed);
+	}
+	if (held) {
+		pm_runtime_mark_last_busy(dev);
+		pm_runtime_put_autosuspend(dev);
+	}
+}
+
+/* Session ops->hung: may run under the session lock, so only queue. */
+static void ane_fw_hung(void *ctx, int error)
+{
+	struct ane_fw_backend *b = ctx;
+
+	if (!READ_ONCE(ane_t6021_hung_stop))
+		return;
+	dev_warn(&b->pdev->dev, "H17 ANE: session quarantined (%d); restarting the engine\n",
+		 error);
+	queue_work(system_dfl_wq, &b->recover);
 }
 
 /*
@@ -1162,6 +1349,11 @@ int ane_fw_staged_runtime_suspend(struct device *dev)
 		return -EBUSY;
 	/* Closes admission and waits for every request in flight. */
 	ane_h16_session_sleep(&b->session, true);
+	/* The gate release on the way quarantined it: that is the recovery's (ane_fw_hung()). */
+	if (b->session.quarantined) {
+		ane_h16_session_sleep(&b->session, false);
+		return -EBUSY;
+	}
 	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
 		if (b->transport.pending[ch].active) {
 			/* Something is still pending on a ring: autosuspend tries later. */
@@ -1243,6 +1435,26 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	b->sys_off_at = 0;
 	b->sys_off_pmgr = 0;
 	b->sys_on_pmgr = 0;
+	/*
+	 * A session quarantined by a hung request (or by the gate release just
+	 * now): the firmware can't be asked for anything, so the engine goes
+	 * off under it, and this sleep takes the deep path, as after a failed
+	 * stop. The resume ends the quarantine once the power-off is proven.
+	 */
+	if (b->session.quarantined) {
+		if (b->powered)
+			apple_sleep_request_deep_once();
+		ret = ane_fw_hung_down(b, false);
+		dev_info(&b->pdev->dev, "H17 ANE: hung engine powered off for system sleep (%d)\n",
+			 ret);
+		if (ret) {
+			ane_fw_quarantine(b, ret);
+			ane_h16_session_sleep(&b->session, false);
+			return ret;
+		}
+		b->slept = true;
+		return 0;
+	}
 	if (!ane_fw_sleep_warm(b)) {
 		ret = ane_fw_cold_cycle_down(b);
 		if (ret == -EBUSY) {
@@ -1304,6 +1516,9 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
 		b->sys_offs++;
 		b->sys_off_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		b->sys_off_at = now;
+		/* After a hung engine's power-down: the proof it is gone. */
+		if (smp_load_acquire(&b->hung_down) && ane_fw_sys_off(b->sys_off_pmgr))
+			WRITE_ONCE(b->hung_off, true);
 	} else if (action == GENPD_NOTIFY_ON) {
 		b->sys_ons++;
 		b->sys_on_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
@@ -1316,6 +1531,7 @@ static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, v
 
 static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 {
+	bool recover = false, warm;
 	s64 ready, first;
 	u64 start;
 	int ret;
@@ -1324,8 +1540,23 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	if (!b->slept)
 		return;
 	b->slept = false;
+	/* A hung engine went off for this sleep: a cold boot once proven gone. */
+	if (b->session.quarantined) {
+		bool proven = ane_fw_hung_proven(b);
+
+		if (!READ_ONCE(ane_t6021_hung_stop) || !proven) {
+			dev_err(&b->pdev->dev,
+				"H17 ANE: hung engine %s (ANE_SYS genpd off %u, PMGR %#x at off; CPU %#x sub-block %#x); kept quarantined\n",
+				ane_t6021_hung_stop ? "not proven off across the sleep" :
+				"left quarantined (hung_stop=0)", b->sys_offs, b->sys_off_pmgr,
+				b->cold.cpu, b->cold.subblock);
+			ane_h16_session_sleep(&b->session, false);
+			return;
+		}
+		recover = true;
+	}
 	/* Stay off until a request needs the engine, as macOS does. */
-	if (b->soc->macos_sleep && !b->session.quarantined) {
+	if (b->soc->macos_sleep && !recover) {
 		WRITE_ONCE(b->parked, true);
 		WRITE_ONCE(b->session.parked, true);
 		dev_info(&b->pdev->dev, "H17 ANE: resume ok: parked until the next request\n");
@@ -1335,19 +1566,25 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	b->resume_ready_ns = 0;
 	b->resume_first_ns = 0;
 	b->resume_replayed = 0;
-	ret = ane_fw_sleep_warm(b) ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
-	if (ret && ane_fw_sleep_warm(b)) {
+	/* The firmware of a hung engine was not suspended: only a cold boot. */
+	warm = ane_fw_sleep_warm(b) && !recover;
+	ret = warm ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b, recover);
+	if (ret && warm) {
 		/* Fall back to the cold cycle: off again, then boot from the preload. */
 		dev_warn(&b->pdev->dev, "H17 ANE: warm boot failed (%d); cold boot and program replay\n",
 			 ret);
 		ret = b->powered ? ane_fw_power_down(b) : 0;
 		if (!ret)
-			ret = ane_fw_cold_cycle_boot(b);
+			ret = ane_fw_cold_cycle_boot(b, false);
 	}
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
 		b->session.quarantined = true;
+	} else if (recover) {
+		ane_fw_hung_recovered(b);
+		ane_fw_rpm_idle(b);
+		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine recovered by system sleep\n");
 	}
 	ane_h16_session_sleep(&b->session, false);
 	/* genpd's record of the domain across this sleep (boot time, so it counts s2idle). */
@@ -1404,6 +1641,8 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE) {
 		WRITE_ONCE(b->in_sleep, true);
 		WRITE_ONCE(b->session.wake_blocked, true);
+		/* A recovery under way finishes first; the sleep handles later ones. */
+		flush_work(&b->recover);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		struct device *dev = &b->pdev->dev;
@@ -2289,6 +2528,7 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.sync = ane_fw_program_sync,
 	.busy = ane_fw_program_busy,
 	.wake = ane_fw_session_wake,
+	.hung = ane_fw_hung,
 };
 
 /*
@@ -2331,14 +2571,16 @@ static const struct file_operations ane_fw_execute_fops = {
 
 static void ane_fw_debugfs(struct ane_fw_backend *b)
 {
-	struct dentry *root = debugfs_lookup("ane-h17", NULL);
+	struct dentry *root = debugfs_lookup("ane-h17", NULL), *dir;
 	bool found = root;
 
 	if (!found)
 		root = debugfs_create_dir("ane-h17", NULL);
-	debugfs_create_file("execute", 0600,
-			    debugfs_create_dir(dev_name(&b->pdev->dev), root),
-			    &b->session, &ane_fw_execute_fops);
+	dir = debugfs_create_dir(dev_name(&b->pdev->dev), root);
+	debugfs_create_file("execute", 0600, dir, &b->session, &ane_fw_execute_fops);
+	/* Hung-request recoveries (ane_fw_hung()), at runtime or by a sleep. */
+	debugfs_create_u64("recoveries", 0400, dir, &b->recoveries);
+	debugfs_create_u64("recover_failures", 0400, dir, &b->recover_failures);
 	if (found)
 		dput(root);
 }
@@ -2810,6 +3052,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
+	INIT_WORK(&b->recover, ane_fw_recover_work);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
@@ -2921,6 +3164,7 @@ bool ane_fw_staged_exit(void)
 	if (!b)
 		return false;
 	cancel_work_sync(&b->start);
+	cancel_work_sync(&b->recover);
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;
