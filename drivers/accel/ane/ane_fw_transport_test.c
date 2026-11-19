@@ -914,14 +914,14 @@ static void ane_transport_shared_total_test(struct kunit *test)
 	unsigned int i;
 
 	KUNIT_ASSERT_EQ(test, ane_fw_transport_arm(&f->t), 0);
-	for (i = 0; i < 12; i++) {
+	for (i = 0; i < ANE_FW_SHARED_TOTAL / SZ_1M; i++) {
 		ane_test_shared_request(f, 0, SZ_1M, 0);
 		KUNIT_ASSERT_EQ(test, ane_fw_transport_shared(&f->t), 0);
 	}
 	KUNIT_EXPECT_EQ(test, f->t.shared_bytes, (size_t)ANE_FW_SHARED_TOTAL);
 	ane_test_shared_request(f, 0, 1, 0);
 	KUNIT_EXPECT_EQ(test, ane_fw_transport_shared(&f->t), -ENOSPC);
-	KUNIT_EXPECT_EQ(test, f->allocs, 12U);
+	KUNIT_EXPECT_EQ(test, f->allocs, (unsigned int)(ANE_FW_SHARED_TOTAL / SZ_1M));
 }
 
 static void ane_transport_shared_report_test(struct kunit *test)
