@@ -1211,6 +1211,18 @@ module_param(recover_backoff_ms, uint, 0644);
 MODULE_PARM_DESC(recover_backoff_ms,
 		 "A second recovery within recover_window_s waits this long after the first, each later one twice the one before (0-60000)");
 
+/*
+ * The clean way down (ane_fw_firmware_stop()) and macOS power a DART down only
+ * with every port idle. A runtime recovery cuts the power under a firmware
+ * that did not stop; it does so only once the DART ports are idle too, so no
+ * DMA is cut off mid-flight. A system sleep, which takes the deep path for a
+ * hung engine, recovers one whose ports stay busy.
+ */
+static bool recover_need_idle = true;
+module_param(recover_need_idle, bool, 0644);
+MODULE_PARM_DESC(recover_need_idle,
+		 "Power a hung H17 ANE off at runtime only with its DART ports idle; else leave it to the next system sleep");
+
 static void ane_fw_recover_policy(struct ane_fw_recover_policy *p)
 {
 	p->burst = clamp(READ_ONCE(recover_burst), 1U, (unsigned int)ANE_FW_RECOVER_BURST_MAX);
@@ -1273,6 +1285,14 @@ static void ane_fw_recover_work(struct work_struct *work)
 	ane_h16_session_sleep(&b->session, true);
 	/* Time for the engine to drain what it has in flight, as on H16. */
 	msleep(settle);
+	if (b->powered && READ_ONCE(recover_need_idle) && ane_fw_dart_idle(b)) {
+		b->recover_failures++;
+		dev_err(&b->pdev->dev,
+			"H17 ANE: hung engine still has DMA in flight after %u ms; no power cut at runtime, quarantined until the next system sleep\n",
+			settle);
+		ane_h16_session_sleep(&b->session, false);
+		return;
+	}
 	ret = ane_fw_hung_down(b, true);
 	if (!ret && !ane_fw_hung_wait_off(b))
 		ret = -ETIMEDOUT;
