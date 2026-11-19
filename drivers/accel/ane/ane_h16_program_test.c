@@ -3451,7 +3451,7 @@ static void fw_boot_allocations(struct kunit *test, struct prog_fw *f)
 /*
  * Every live program holds a 2 MiB EXPP process pool, which the firmware
  * asks for during CREATE and waits for. Six programs at once on the Neo
- * went past the 12 MiB shared quota: the pool was refused, the CREATE
+ * went past the then 12 MiB shared quota: the pool was refused, the CREATE
  * stalled, and the quarantine took the five other programs with it. Now
  * the LOAD past the quota fails with -ENOSPC before any traffic, the
  * engine stays up, the other programs keep running, and a closed

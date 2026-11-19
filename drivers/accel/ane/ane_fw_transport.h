@@ -15,7 +15,11 @@
 #define ANE_FW_DATA_CHAIN 7
 #define ANE_FW_SHARED_MAX 64
 #define ANE_FW_SHARED_LIMIT SZ_1M
-#define ANE_FW_SHARED_TOTAL (12 * SZ_1M)
+/*
+ * Host policy: a live program holds a 2 MiB process pool, so this allows
+ * fifteen at once next to the firmware's own small allocations.
+ */
+#define ANE_FW_SHARED_TOTAL (32 * SZ_1M)
 #define ANE_FW_SHARED_EXPP 0x45585050U
 /* The firmware's text log, 0x80-byte records. */
 #define ANE_FW_SHARED_LOG 0x004c4f47U
@@ -721,8 +725,8 @@ ane_fw_transport_free(struct ane_fw_transport *t, void *slot, u64 dva, u64 bytes
  * A retired allocation that can serve a new request of this tag and size, or
  * shared_count. Every program LOAD asks for a 2 MiB EXPP process pool and the
  * firmware frees it after UNLOAD (often only during a later program), but the
- * backing stays mapped until reset: without reuse the 12 MiB quota ran out at
- * the sixth program of a boot. Only memory the firmware itself gave back by
+ * backing stays mapped until reset: without reuse the quota ran out a few
+ * programs into a boot. Only memory the firmware itself gave back by
  * FREE, or that the host reserved for the request
  * (ane_fw_transport_shared_reserve()), is served again, and only for the
  * same tag and size.
