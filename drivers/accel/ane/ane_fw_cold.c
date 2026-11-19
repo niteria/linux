@@ -1083,9 +1083,16 @@ static void ane_fw_idle_park(struct work_struct *work)
 		dev_err(&b->pdev->dev, "H17 ANE: idle park failed (%d): quarantined\n", ret);
 		return;
 	}
+	/*
+	 * Parked as after a wake, with the session left closed: there is no
+	 * firmware to send anything to. A close now is deferred and a request
+	 * waits in ane_h16_session_enter(), which wakes the engine; the wake
+	 * reopens the session, and a program closed meanwhile is lost to the
+	 * new firmware and only released.
+	 */
 	WRITE_ONCE(b->parked, true);
 	WRITE_ONCE(b->session.parked, true);
-	ane_h16_session_sleep(&b->session, false);
+	wake_up_all(&b->session.wake);
 	dev_info(&b->pdev->dev, "H17 ANE: idle %u ms: parked until the next request\n",
 		 READ_ONCE(idle_park_ms));
 	return;
