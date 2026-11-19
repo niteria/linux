@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * DisplayPort/HDMI audio on the MacBook Air 13" (M4, J713), as on the M4
+ * Max laptops (t6041-j614c-j616c.dtsi). The J713's ADT: dcpext0's audio is
+ * dp-audio1 (SIO DMA channel 0x66, PMGR DPA1 = 0x70) and dcpext1's is
+ * dp-audio2 (0x68, DPA2 = 0x7b); the PMGR has SPI_P, UART_P and DPA_P under
+ * SIO, and DPA0-4 under DPA_P. The domains are enabled in
+ * t8132-j713-pmgr.dtsi. The SIO stays disabled here: the loader enables it
+ * once it has reserved the firmware iBoot loaded (it finds it by the alias).
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t8132-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext>;
+			};
+		};
+	};
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep them on. */
+&ps_sio_cpu {
+	power-domains = <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+};
+
+&dart_sio0 {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};

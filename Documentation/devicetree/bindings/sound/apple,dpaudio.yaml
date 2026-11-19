@@ -31,6 +31,7 @@ properties:
     items:
       - enum:
           - apple,t8112-dpaudio
+          - apple,t8132-dpaudio
       - const: apple,dpaudio
 
   reg:

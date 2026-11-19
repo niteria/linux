@@ -123,7 +123,7 @@
 };
 
 &ps_sio_cpu {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_fpwm0 {
@@ -185,7 +185,7 @@
 };
 
 &ps_dpa_p {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_aes {
@@ -289,7 +289,7 @@
 };
 
 &ps_dpa1 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_atc0_cio_usb {
@@ -333,7 +333,7 @@
 };
 
 &ps_dpa2 {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_atc2_cio_usb {

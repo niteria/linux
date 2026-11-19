@@ -11,6 +11,7 @@
 
 #include "t8132.dtsi"
 #include "t8132-j713-j715.dtsi"
+#include "t8132-j713-dpaudio.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 
 / {
