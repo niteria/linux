@@ -21,6 +21,8 @@
 		compatible = "apple,t8132-sio", "apple,sio";
 		reg = <0x3 0xade00000 0x0 0x8000>,
 		      <0x3 0xad850000 0x0 0x4000>;
+		reg-names = "asc", "auxiliary";
+		dma-channels = <128>;
 		#dma-cells = <1>;
 		mboxes = <&sio_mbox>;
 		iommus = <&dart_sio0 0>;
